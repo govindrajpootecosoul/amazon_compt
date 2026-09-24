@@ -1168,8 +1168,12 @@ async def manual_warmup(page: Page, domain: str, marketplace: str) -> bool:
     home = f"https://{domain}/"
     print("\n" + "=" * 62)
     if config.CONNECT_EXISTING_CHROME:
-        print("WARMUP: Use Chrome opened by start_chrome.bat (NOT Playwright Chrome).")
-        print(f"  1) Double-click amazon/start_chrome.bat")
+        hint = chrome_start_script()
+        print(f"WARMUP: Use Chrome opened by {hint} (NOT Playwright Chrome).")
+        if sys.platform == "win32":
+            print(f"  1) Double-click {hint}")
+        else:
+            print(f"  1) In Terminal: chmod +x {hint} && ./{hint}")
         print(f"  2) In that Chrome, open {home}")
         print("  3) Complete captcha / continue shopping if shown")
         print("  4) Come back here and press ENTER")
@@ -1191,7 +1195,7 @@ async def manual_warmup(page: Page, domain: str, marketplace: str) -> bool:
     title = await page.title()
     if is_challenge_html(html, title):
         print("[WARMUP] Still on captcha / robot check. Captcha did NOT pass.")
-        print("[WARMUP] Use amazon/start_chrome.bat, pass captcha, then run again.")
+        print(f"[WARMUP] Use {chrome_start_script()}, pass captcha, then run again.")
         return False
 
     print(f"[WARMUP] OK — Amazon {marketplace.upper()} session looks good. Starting scrape...\n")
@@ -2104,14 +2108,34 @@ async def scrape_amazon_asin(
 # ---------------------------------------------------------------------------
 
 
+def chrome_start_script() -> str:
+    """Platform-specific helper script name (amazon/)."""
+    return "amazon/start_chrome.bat" if sys.platform == "win32" else "amazon/start_chrome.sh"
+
+
 def find_chrome_executable() -> Path | None:
-    candidates = [
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-    ]
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+    else:
+        candidates = [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/chromium-browser"),
+            Path("/usr/bin/chromium"),
+            Path("/snap/bin/chromium"),
+        ]
     for path in candidates:
         if path.exists():
             return path
@@ -2171,7 +2195,7 @@ async def connect_existing_chrome(
             launch_debug_chrome(domain)
         except Exception as e:
             print(f"[BROWSER] Could not launch Chrome: {e}")
-            print("[BROWSER] Or double-click amazon/start_chrome.bat manually.")
+            print(f"[BROWSER] Or run {chrome_start_script()} manually.")
             raise SystemExit(1) from e
         print("[BROWSER] Waiting for Chrome to start...")
         if not await wait_for_debug_port(45):
@@ -2192,7 +2216,7 @@ async def connect_existing_chrome(
                 await asyncio.sleep(1.5)
 
     print(f"[BROWSER] Could not connect: {last_error}")
-    print("[BROWSER] Fix: close Chrome, run amazon/start_chrome.bat, then retry.")
+    print(f"[BROWSER] Fix: close Chrome, run {chrome_start_script()}, then retry.")
     raise SystemExit(1) from last_error
 
 
