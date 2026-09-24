@@ -1,0 +1,2484 @@
+"""
+Amazon product scraper (geographic marketplaces).
+
+Headless background mode by default (no visible browser).
+
+From India: set a residential proxy for the target country in amazon/config.py
+(PROXIES["us"] / uk / de / ca). Without it the scraper refuses to start so your
+home IP is not burned.
+
+Put ASINs into amazon/inputs/{us,uk,de,ca}_asins.txt
+
+Run:
+  python amazon/scraper.py us
+  python amazon/scraper.py ae      # UAE amazon.ae
+  python amazon/scraper.py all     # every marketplace in config
+
+Output: amazon/output/{YYYY-MM-DD_HHMMSS}/amazon_{geo}_data.xlsx
+(new dated folder + file every run; multiple offers = multiple rows)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+
+# Ensure amazon/ is on path when run as python amazon/scraper.py
+_AMAZON_DIR = Path(__file__).resolve().parent
+if str(_AMAZON_DIR) not in sys.path:
+    sys.path.insert(0, str(_AMAZON_DIR))
+os.chdir(_AMAZON_DIR)
+
+import config
+
+COLUMNS = [
+    "asin",
+    "marketplace",
+    "scraped_at",
+    "title",
+    "brand",
+    "price",
+    "was_price",
+    "currency",
+    "availability",
+    "offer_index",
+    "offer_count",
+    "is_buybox_winner",
+    "buybox_available",
+    "buybox_price",
+    "buybox_seller",
+    "buybox_ships_from",
+    "buybox_fulfilled_by",
+    "buybox_is_amazon",
+    "buybox_condition",
+    "buybox_delivery",
+    "rating",
+    "reviews_count",
+    "category",
+    # Product information — Item details
+    "recommended_uses",
+    "number_of_pieces",
+    "included_components",
+    "item_type_name",
+    "reusability",
+    "gtin",
+    "manufacturer",
+    "upc",
+    "item_highlight",
+    "unit_count",
+    "model_number",
+    "manufacturer_part_number",
+    "best_sellers_rank",
+    # Style
+    "color",
+    "style_name",
+    "shape",
+    "pattern",
+    "finish_types",
+    "theme",
+    "occasion_type",
+    "seasons",
+    # Materials & Care
+    "material_type",
+    "product_care_instructions",
+    "material_features",
+    # Measurements
+    "item_dimensions",
+    "size",
+    "item_weight",
+    "net_content_weight",
+    # Features & Specs
+    "special_features",
+    # Catch-all for any extra detail rows
+    "product_details_raw",
+    "features",
+    "description",
+    "image_url",
+    "seller",
+    "ships_from",
+    "url",
+    "http_status",
+    "status",
+    "error",
+]
+
+# Amazon "Product information" label → Excel column
+PRODUCT_DETAIL_LABEL_MAP = {
+    "brand name": "brand",
+    "brand": "brand",
+    "recommended uses for product": "recommended_uses",
+    "recommended uses": "recommended_uses",
+    "number of pieces": "number_of_pieces",
+    "included components": "included_components",
+    "item type name": "item_type_name",
+    "item type": "item_type_name",
+    "reusability": "reusability",
+    "global trade identification number": "gtin",
+    "gtin": "gtin",
+    "manufacturer": "manufacturer",
+    "upc": "upc",
+    "item highlight": "item_highlight",
+    "unit count": "unit_count",
+    "model number": "model_number",
+    "model": "model_number",
+    "item model number": "model_number",
+    "manufacturer part number": "manufacturer_part_number",
+    "part number": "manufacturer_part_number",
+    "best sellers rank": "best_sellers_rank",
+    "asin": "asin",
+    "customer reviews": "customer_reviews_text",
+    "color": "color",
+    "colour": "color",
+    "style name": "style_name",
+    "style": "style_name",
+    "shape": "shape",
+    "pattern": "pattern",
+    "finish types": "finish_types",
+    "finish type": "finish_types",
+    "theme": "theme",
+    "occasion type": "occasion_type",
+    "occasion": "occasion_type",
+    "seasons": "seasons",
+    "material type": "material_type",
+    "material": "material_type",
+    "product care instructions": "product_care_instructions",
+    "care instructions": "product_care_instructions",
+    "material features": "material_features",
+    "item dimensions l x w x thickness": "item_dimensions",
+    "item dimensions lxwxh": "item_dimensions",
+    "product dimensions": "item_dimensions",
+    "item dimensions": "item_dimensions",
+    "dimensions": "item_dimensions",
+    "size": "size",
+    "item weight": "item_weight",
+    "weight": "item_weight",
+    "net content weight": "net_content_weight",
+    "other special features of the product": "special_features",
+    "special features": "special_features",
+    "special feature": "special_features",
+}
+
+
+# ---------------------------------------------------------------------------
+# Stealth
+# ---------------------------------------------------------------------------
+
+
+async def apply_stealth(page: Page) -> None:
+    try:
+        from playwright_stealth import Stealth
+
+        await Stealth().apply_stealth_async(page)
+        return
+    except Exception:
+        pass
+    try:
+        from playwright_stealth import stealth_async
+
+        await stealth_async(page)
+        return
+    except Exception:
+        pass
+    await page.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        """
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inputs / outputs
+# ---------------------------------------------------------------------------
+
+
+def marketplace_cfg(code: str) -> dict[str, Any]:
+    key = code.strip().lower()
+    if key not in config.MARKETPLACES:
+        raise ValueError(
+            f"Unknown marketplace '{code}'. Use one of: {', '.join(config.MARKETPLACES)}"
+        )
+    return config.MARKETPLACES[key]
+
+
+def product_url(domain: str, asin: str) -> str:
+    return f"https://{domain}/dp/{asin}"
+
+
+def resolve_proxy(marketplace: str) -> dict[str, str] | None:
+    """Return Playwright proxy dict, or None if unset."""
+    raw = None
+    proxies = getattr(config, "PROXIES", None) or {}
+    if isinstance(proxies, dict):
+        raw = proxies.get(marketplace) or proxies.get(marketplace.lower())
+    if not raw:
+        raw = getattr(config, "PROXY_SERVER", None)
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    # Playwright accepts server + optional username/password
+    # Support http://user:pass@host:port
+    m = re.match(
+        r"^(?P<scheme>https?|socks5)://(?:(?P<user>[^:@]+):(?P<pw>[^@]*)@)?(?P<host>.+)$",
+        raw,
+        re.I,
+    )
+    if not m:
+        return {"server": raw}
+    server = f"{m.group('scheme')}://{m.group('host')}"
+    out: dict[str, str] = {"server": server}
+    if m.group("user"):
+        out["username"] = m.group("user")
+        out["password"] = m.group("pw") or ""
+    return out
+
+
+def ensure_proxy_or_exit(marketplace: str, mcfg: dict[str, Any]) -> dict[str, str] | None:
+    proxy = resolve_proxy(marketplace)
+    require = getattr(config, "REQUIRE_PROXY", True)
+    country = mcfg.get("proxy_country", marketplace.upper())
+    if proxy:
+        # Do not print password
+        print(f"[PROXY] OK — using geo proxy for {country} via {proxy['server']}")
+        return proxy
+    if require:
+        print("\n[FATAL] No proxy configured — refusing to scrape from your India IP.")
+        print("  Amazon US/UK/DE/CA from India without a residential proxy will:")
+        print("    - show captcha / robot check")
+        print("    - redirect to amazon.in")
+        print("    - risk blocking your home IP")
+        print(f"\n  Fix: set PROXIES['{marketplace}'] in amazon/config.py")
+        print(f'  Example: PROXIES["{marketplace}"] = "http://USER:PASS@host:port"')
+        print(f"  Use a {country} residential proxy (same country as the marketplace).")
+        print("\n  For a risky local test only: set REQUIRE_PROXY = False (not recommended).")
+        raise SystemExit(2)
+    print(
+        f"[WARN] No proxy — scraping {marketplace.upper()} from India IP. "
+        "High chance of captcha/block. Keep MAX_ASINS small."
+    )
+    return None
+
+
+def _read_lines(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    values: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for part in re.split(r"[\s,;|]+", line):
+            part = part.strip().strip('"').strip("'").upper()
+            if part and part.lower() not in {"asin", "asins", "id"}:
+                values.append(part)
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def load_asins(path_str: str) -> list[str]:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"ASIN file not found: {path.resolve()}")
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path, dtype=str)
+        col = next((c for c in ["asin", "ASIN", "Asin"] if c in df.columns), df.columns[0])
+        values = df[col].dropna().astype(str).str.strip().str.upper().tolist()
+        seen: set[str] = set()
+        out: list[str] = []
+        for v in values:
+            if v and v.lower() != "asin" and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+    return _read_lines(path)
+
+
+def load_results(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        if path.suffix.lower() in {".xlsx", ".xls"}:
+            existing = pd.read_excel(path, dtype=str)
+        else:
+            existing = pd.read_csv(path, dtype=str)
+        return existing.fillna("").to_dict(orient="records")
+    except Exception:
+        return []
+
+
+def save_results(results: list[dict[str, Any]], path: Path) -> Path:
+    """
+    Save to the main Excel path. If that file is open in Excel (Permission denied),
+    overwrite a single fixed autosave file instead of creating a new file every time.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(results)
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    df = df[COLUMNS]
+
+    def _write(target: Path) -> None:
+        if target.suffix.lower() in {".xlsx", ".xls"}:
+            df.to_excel(target, index=False, engine="openpyxl")
+        else:
+            df.to_csv(target, index=False)
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            _write(path)
+            return path
+        except PermissionError as e:
+            last_err = e
+            print(
+                f"[SAVE] Permission denied writing {path.name} "
+                f"(file is probably open in Excel). Retry {attempt}/3..."
+            )
+            time.sleep(1.5)
+        except Exception as e:
+            last_err = e
+            break
+
+    # One fixed autosave file (reused) — avoids dozens of timestamped copies
+    alt = path.with_name(f"{path.stem}_autosave{path.suffix}")
+    try:
+        _write(alt)
+        print(f"[SAVE] Could not overwrite {path.name} (close Excel!).")
+        print(f"[SAVE] Updating single autosave file: {alt.name}")
+        return alt
+    except Exception as e:
+        print(f"[SAVE] FATAL save error: {last_err or e}")
+        raise
+
+
+def make_run_output_path(
+    marketplace: str, run_folder: Path | None = None
+) -> Path:
+    """
+    Always create a separate Excel for this run.
+    Example: output/2026-09-11_095830/amazon_us_data.xlsx
+
+    If run_folder is passed (e.g. when scraping all geos in one cmd),
+    all files share that same date-time folder.
+    """
+    root = Path(getattr(config, "OUTPUT_DIR", "output"))
+    if run_folder is None:
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        if getattr(config, "OUTPUT_FOLDER_BY_DATETIME", True):
+            run_folder = root / stamp
+        else:
+            run_folder = root
+    run_folder.mkdir(parents=True, exist_ok=True)
+    return run_folder / f"amazon_{marketplace}_data.xlsx"
+
+
+def upsert_result(results: list[dict[str, Any]], row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replace all rows for this ASIN with the new row(s)."""
+    return upsert_asin_rows(results, str(row.get("asin", "")), [row])
+
+
+def upsert_asin_rows(
+    results: list[dict[str, Any]], asin: str, new_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    key = str(asin).upper()
+    out = [r for r in results if str(r.get("asin", "")).upper() != key]
+    out.extend(new_rows)
+    return out
+
+
+def successful_asins(results: list[dict[str, Any]]) -> set[str]:
+    """ASINs that should not be scraped again: Success (with buy box fields) or Skip."""
+    if getattr(config, "FORCE_RESCRAPE_ALL", False):
+        return set()
+    keys: set[str] = set()
+    for r in results:
+        status = str(r.get("status", "")).lower()
+        asin = str(r.get("asin", "")).upper()
+        if not asin:
+            continue
+        if status in {"skip", "notfound"}:
+            keys.add(asin)
+            continue
+        if status == "success" and r.get("title"):
+            # Done once buy box status is filled (Yes / no buybox / No)
+            if r.get("buybox_available"):
+                keys.add(asin)
+    return keys
+
+
+def _clean_seller_name(text: str | None) -> str | None:
+    if not text:
+        return None
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    t = re.sub(
+        r"^(sold by|ships from|fulfilled by|delivered by|dispatched from|"
+        r"shipper\s*/\s*seller|brand:|seller:|merchant:|بيع من|يشحن من|تم التوصيل بواسطة)\s*[:\-]?\s*",
+        "",
+        t,
+        flags=re.I,
+    ).strip()
+    # Collapse noisy Amazon fulfillment phrases
+    if re.search(r"amazon.*fulfilled by amazon", t, re.I):
+        if re.search(r"amazon\.ae", t, re.I):
+            return "Amazon.ae"
+        return "Amazon"
+    t = re.sub(r"\s*\d(?:\.\d)?\s*out of\s*5.*$", "", t, flags=re.I).strip()
+    t = re.sub(r"\s*\(?\d[\d,]*\s*ratings?\)?\s*$", "", t, flags=re.I).strip()
+    # Reject UI column headers / labels (amazon.ae AOD shows "Shipper / Seller")
+    junk = {
+        "delivered by",
+        "sold by",
+        "ships from",
+        "fulfilled by",
+        "by",
+        "shipper",
+        "seller",
+        "shipper / seller",
+        "shipper/seller",
+        "shipper / seller information",
+        "price",
+        "condition",
+        "delivery",
+    }
+    if t.lower() in junk:
+        return None
+    if re.fullmatch(r"shipper\s*/\s*seller.*", t, flags=re.I):
+        return None
+    if re.fullmatch(
+        r"(sold by|ships from|fulfilled by|delivered by|amazon\.ae\s*delivery)?",
+        t,
+        flags=re.I,
+    ):
+        return None
+    if len(t) < 2:
+        return None
+    t = re.sub(r"\s*\|\s*.*$", "", t).strip()
+    if t.lower() in junk:
+        return None
+    return t or None
+
+
+def _is_amazon_seller(name: str | None) -> bool:
+    if not name:
+        return False
+    n = name.lower().strip()
+    amazon_names = {
+        "amazon",
+        "amazon.com",
+        "amazon.ca",
+        "amazon.co.uk",
+        "amazon.de",
+        "amazon.ae",
+        "amazon.com.au",
+        "amazon.in",
+    }
+    if n in amazon_names:
+        return True
+    if n.startswith("amazon."):
+        return True
+    if "amazon.ae" in n or n == "amazon ae":
+        return True
+    return False
+
+
+def _finalize_offer(raw: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    avail = raw.get("buybox_available")
+    if avail in (None, "", "No") and not raw.get("buybox_price") and not raw.get("buybox_seller"):
+        out["buybox_available"] = "no buybox"
+    else:
+        out["buybox_available"] = avail or (
+            "Yes" if raw.get("buybox_price") or raw.get("buybox_seller") else "no buybox"
+        )
+
+    out["buybox_price"] = _clean_price(raw.get("buybox_price"))
+    out["buybox_seller"] = _clean_seller_name(raw.get("buybox_seller"))
+    out["buybox_ships_from"] = _clean_seller_name(raw.get("buybox_ships_from"))
+    out["buybox_fulfilled_by"] = _clean_seller_name(raw.get("buybox_fulfilled_by"))
+    out["buybox_condition"] = _as_text(raw.get("buybox_condition"))
+    out["buybox_delivery"] = _as_text(raw.get("buybox_delivery"))
+
+    # If fulfilled/ships says Amazon but seller empty → seller = Amazon(.ae)
+    for field in ("buybox_ships_from", "buybox_fulfilled_by"):
+        val = out.get(field)
+        if val and _is_amazon_seller(val) and not out.get("buybox_seller"):
+            out["buybox_seller"] = val if "amazon" in val.lower() else "Amazon"
+            break
+    # If seller empty but merchant_info_raw had amazon
+    if not out.get("buybox_seller") and raw.get("_amazon_fallback"):
+        out["buybox_seller"] = str(raw.get("_amazon_fallback"))
+
+    seller = out.get("buybox_seller")
+    ships = out.get("buybox_ships_from")
+    fulfilled = out.get("buybox_fulfilled_by")
+    if out["buybox_available"] == "no buybox":
+        out["buybox_is_amazon"] = None
+    elif _is_amazon_seller(seller) or _is_amazon_seller(ships) or _is_amazon_seller(fulfilled):
+        out["buybox_is_amazon"] = "Yes"
+    elif seller or ships:
+        out["buybox_is_amazon"] = "No"
+    else:
+        out["buybox_is_amazon"] = None
+
+    if raw.get("is_buybox_winner"):
+        out["is_buybox_winner"] = raw["is_buybox_winner"]
+    return out
+
+
+async def extract_buybox(page: Page) -> dict[str, Any]:
+    """Extract primary buy box winner details (works on .com / .ae / etc.)."""
+    try:
+        raw = await page.evaluate(
+            """() => {
+                const out = {
+                    buybox_available: null,
+                    buybox_price: null,
+                    buybox_seller: null,
+                    buybox_ships_from: null,
+                    buybox_fulfilled_by: null,
+                    buybox_condition: null,
+                    buybox_delivery: null,
+                    _amazon_fallback: null,
+                };
+                const text = (el) => (el && el.textContent ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+                const cleanLabelValue = (t) => {
+                    if (!t) return null;
+                    let s = t.replace(/\\s+/g, ' ').trim();
+                    s = s.replace(/^(sold by|ships from|fulfilled by|delivered by|dispatched from)\\s*[:\\-]?\\s*/i, '').trim();
+                    if (!s || /^(sold by|ships from|fulfilled by|delivered by)$/i.test(s)) return null;
+                    return s;
+                };
+
+                const addBtn =
+                    document.querySelector('#add-to-cart-button') ||
+                    document.querySelector('#submit.add-to-cart') ||
+                    document.querySelector('input#add-to-cart-button') ||
+                    document.querySelector('#buy-now-button') ||
+                    document.querySelector('input[name="submit.add-to-cart"]');
+                out.buybox_available = addBtn ? 'Yes' : 'No';
+
+                const priceRoots = [
+                    '#price_inside_buybox',
+                    '#corePrice_feature_div .a-price:not(.a-text-price) span.a-offscreen',
+                    '#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) span.a-offscreen',
+                    '#apex_desktop .a-price:not(.a-text-price) span.a-offscreen',
+                    '#tp_price_block_total_price_ww span.a-offscreen',
+                    '#newBuyBoxPrice',
+                    '.a-price .a-offscreen',
+                ];
+                for (const sel of priceRoots) {
+                    const el = document.querySelector(sel);
+                    if (el && text(el)) { out.buybox_price = text(el); break; }
+                }
+
+                // Tabular buybox: label attribute OR sibling label text
+                document.querySelectorAll(
+                    '#tabular-buybox tr, #tabular_feature_div tr, #desktop_qualifiedBuyBox tr, #buybox tr'
+                ).forEach((tr) => {
+                    const labelEl = tr.querySelector('[tabular-attribute-name], .tabular-buybox-label, .a-text-bold, td:first-child');
+                    const valueEl = tr.querySelector(
+                        '.tabular-buybox-text, [tabular-attribute-name] + *, .offer-display-feature-text, td:last-child a, td:last-child span, a#sellerProfileTriggerId'
+                    );
+                    const label = ((labelEl && (labelEl.getAttribute('tabular-attribute-name') || labelEl.innerText)) || '').toLowerCase();
+                    const val = cleanLabelValue(text(valueEl) || text(tr.querySelector('td:last-child')));
+                    if (!val) return;
+                    if (/sold|seller|merchant|بيع/.test(label) && !out.buybox_seller) out.buybox_seller = val;
+                    if (/ship|dispatch|يشحن|delivery from/.test(label) && !out.buybox_ships_from) out.buybox_ships_from = val;
+                    if (/fulfill|delivered by|تم التوصيل/.test(label) && !out.buybox_fulfilled_by) out.buybox_fulfilled_by = val;
+                });
+
+                // offer-display-feature blocks (common on AE / new buybox)
+                document.querySelectorAll('[offer-display-feature-name], .offer-display-feature-text').forEach((el) => {
+                    const name = (el.getAttribute('offer-display-feature-name') || '').toLowerCase();
+                    const t = text(el);
+                    const val = cleanLabelValue(t);
+                    if (!val) return;
+                    if ((/merchant|sold|seller/.test(name) || /sold by/i.test(t)) && !out.buybox_seller) {
+                        out.buybox_seller = val;
+                    }
+                    if ((/fulfiller|ships|dispatch/.test(name) || /ships from|delivered by/i.test(t)) && !out.buybox_ships_from) {
+                        out.buybox_ships_from = val;
+                    }
+                });
+
+                // Direct seller link (best signal)
+                const sellerLink = document.querySelector(
+                    '#sellerProfileTriggerId, a#sellerProfileTriggerId, #merchant-info a, a[href*="/gp/help/seller"], a[href*="/sp?seller="], a[href*="/gp/aag/main"]'
+                );
+                if (sellerLink && text(sellerLink) && !out.buybox_seller) {
+                    out.buybox_seller = cleanLabelValue(text(sellerLink));
+                }
+
+                // merchant-info / fulfiller blocks — parse full sentence
+                const infoBlocks = [
+                    '#merchant-info',
+                    '#merchantInfoFeature_feature_div',
+                    '#fulfillerInfoFeature_feature_div',
+                    '#availability_feature_div',
+                    '#desktop_qualifiedBuyBox',
+                    '#buybox',
+                ];
+                for (const sel of infoBlocks) {
+                    const t = text(document.querySelector(sel));
+                    if (!t) continue;
+                    if (!out.buybox_seller) {
+                        let m = t.match(/sold by\\s+([^|.]+?)(?:\\s*\\||$|and\\s+fulfilled)/i)
+                            || t.match(/بيع من\\s+([^|.]+)/);
+                        if (m) out.buybox_seller = cleanLabelValue(m[1]);
+                    }
+                    if (!out.buybox_ships_from) {
+                        let m = t.match(/ships from\\s+([^|.]+?)(?:\\s*\\||$)/i)
+                            || t.match(/يشحن من\\s+([^|.]+)/);
+                        if (m) out.buybox_ships_from = cleanLabelValue(m[1]);
+                    }
+                    if (/ships from and sold by amazon/i.test(t) || /sold by amazon\\.ae/i.test(t) || /amazon\\.ae/i.test(t) && /sold by/i.test(t)) {
+                        out._amazon_fallback = /amazon\\.ae/i.test(t) ? 'Amazon.ae' : 'Amazon';
+                        out.buybox_seller = out.buybox_seller || out._amazon_fallback;
+                        out.buybox_ships_from = out.buybox_ships_from || out._amazon_fallback;
+                        out.buybox_fulfilled_by = out.buybox_fulfilled_by || out._amazon_fallback;
+                    }
+                    if (/delivered by\\s+amazon/i.test(t) || /fulfilled by amazon/i.test(t)) {
+                        out.buybox_fulfilled_by = out.buybox_fulfilled_by || ( /amazon\\.ae/i.test(t) ? 'Amazon.ae' : 'Amazon');
+                        out.buybox_ships_from = out.buybox_ships_from || out.buybox_fulfilled_by;
+                    }
+                }
+
+                // "Delivered by Amazon.ae" alone in ships/fulfilled nodes
+                document.querySelectorAll(
+                    '#fulfillerInfoFeature_feature_div .offer-display-feature-text, #mir-layout-DELIVERY_BLOCK, #deliveryBlockMessage'
+                ).forEach((el) => {
+                    const t = text(el);
+                    const m = t && t.match(/(?:delivered by|fulfilled by|ships from)\\s+(.+)/i);
+                    if (m) {
+                        const v = cleanLabelValue(m[1]);
+                        if (v) {
+                            out.buybox_fulfilled_by = out.buybox_fulfilled_by || v;
+                            out.buybox_ships_from = out.buybox_ships_from || v;
+                            if (/amazon/i.test(v) && !out.buybox_seller) out.buybox_seller = v;
+                        }
+                    }
+                });
+
+                if (!out.buybox_fulfilled_by && out.buybox_ships_from) {
+                    out.buybox_fulfilled_by = out.buybox_ships_from;
+                }
+
+                // Last resort: if Add to Cart exists and page is amazon.ae with no seller, mark Amazon.ae
+                if (!out.buybox_seller && out.buybox_available === 'Yes') {
+                    const host = (location.hostname || '').toLowerCase();
+                    if (host.includes('amazon.ae')) {
+                        const pageText = (document.querySelector('#buybox, #desktop_buybox, #rightCol') || document.body).innerText || '';
+                        if (/amazon\\.ae/i.test(pageText) && /sold by|ships from|delivered by/i.test(pageText)) {
+                            out.buybox_seller = 'Amazon.ae';
+                            out._amazon_fallback = 'Amazon.ae';
+                        }
+                    }
+                }
+
+                const cond = document.querySelector('#newAccordionCaption_feature_div, #buyboxAccordianCaption');
+                if (cond && text(cond)) out.buybox_condition = text(cond);
+                else if (document.querySelector('#newAccordionRow, #buyNew_c')) out.buybox_condition = 'New';
+
+                const deliv = document.querySelector(
+                    '#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE, #deliveryBlockMessage, #ddmDeliveryMessage'
+                );
+                if (deliv) out.buybox_delivery = text(deliv);
+
+                const avail = text(document.querySelector('#availability, #availability span, #outOfStock'));
+                if (/cannot be shipped|currently unavailable|out of stock/i.test(avail || '')) {
+                    if (!addBtn) out.buybox_available = 'No';
+                }
+                return out;
+            }"""
+        )
+    except Exception:
+        raw = {}
+
+    if not isinstance(raw, dict):
+        return {"buybox_available": "no buybox"}
+    out = _finalize_offer(raw)
+    out["is_buybox_winner"] = (
+        "Yes" if out.get("buybox_available") not in {None, "no buybox", "No"} else "No"
+    )
+    return out
+
+
+async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
+    """
+    Parse 'Other sellers on Amazon' AOD sidebar / offer-listing.
+    Each offer card must get its own Sold by name (not only the first).
+    """
+    try:
+        await page.evaluate(
+            """() => {
+                const box = document.querySelector('#aod-offer-list, #aod-container, #all-offers-display');
+                if (box) box.scrollTop = box.scrollHeight;
+            }"""
+        )
+        await asyncio.sleep(0.6)
+        await page.evaluate(
+            """() => {
+                const box = document.querySelector('#aod-offer-list, #aod-container, #all-offers-display');
+                if (box) box.scrollTop = 0;
+            }"""
+        )
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    try:
+        raw_list = await page.evaluate(
+            """() => {
+                const text = (el) => (el && el.textContent ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+                const clean = (t) => {
+                    if (!t) return null;
+                    let s = String(t).replace(/\\s+/g, ' ').trim();
+                    s = s.replace(/^(sold by|ships from|fulfilled by|delivered by|shipper\\s*\\/\\s*seller)\\s*[:\\-]?\\s*/i, '').trim();
+                    s = s.replace(/\\s*\\d(?:\\.\\d)?\\s*out of\\s*5.*$/i, '').trim();
+                    s = s.replace(/\\s*\\(?\\d[\\d,]*\\s*ratings?\\)?\\s*$/i, '').trim();
+                    s = s.replace(/\\s*Just Arrived\\s*$/i, '').trim();
+                    if (!s) return null;
+                    // Reject AOD column headers / labels (not real merchant names)
+                    if (/^(sold by|ships from|fulfilled by|delivered by|shipper|seller|shipper\\s*\\/\\s*seller|price|condition|delivery)$/i.test(s)) return null;
+                    if (/^shipper\\s*\\/\\s*seller/i.test(s)) return null;
+                    if (s.length < 2) return null;
+                    return s;
+                };
+                const isLabelOnly = (s) => {
+                    if (!s) return true;
+                    return /^(sold by|ships from|fulfilled by|delivered by|shipper\\s*\\/\\s*seller|shipper|seller)$/i.test(s.trim());
+                };
+                const parseSoldBy = (root) => {
+                    // 1) Seller hyperlinks inside this card
+                    const links = root.querySelectorAll(
+                        'a[href*="/gp/aag/main"], a[href*="/sp?seller="], a[href*="seller="], a[href*="/gp/help/seller"]'
+                    );
+                    for (const link of links) {
+                        const v = clean(text(link));
+                        if (v && !/^amazon\\s*fulfilled/i.test(v) && !isLabelOnly(v)) return v;
+                    }
+
+                    // 2) AE layout: label "Shipper / Seller" then value in next cell / sibling
+                    const all = root.querySelectorAll('span, div, td, th, a');
+                    for (const el of all) {
+                        const t = text(el);
+                        if (!t) continue;
+                        if (!/shipper\\s*\\/\\s*seller|sold by/i.test(t)) continue;
+                        if (isLabelOnly(t) || /^shipper\\s*\\/\\s*seller$/i.test(t.trim())) {
+                            // value may be next sibling or parent's next cell
+                            let sib = el.nextElementSibling;
+                            for (let i = 0; i < 4 && sib; i++, sib = sib.nextElementSibling) {
+                                const a = sib.querySelector && sib.querySelector('a');
+                                const v = clean(a ? text(a) : text(sib));
+                                if (v && !isLabelOnly(v)) return v;
+                            }
+                            const parent = el.parentElement;
+                            if (parent) {
+                                const kids = Array.from(parent.children);
+                                const idx = kids.indexOf(el);
+                                for (let j = idx + 1; j < kids.length && j < idx + 4; j++) {
+                                    const a = kids[j].querySelector && kids[j].querySelector('a');
+                                    const v = clean(a ? text(a) : text(kids[j]));
+                                    if (v && !isLabelOnly(v)) return v;
+                                }
+                                // same row: next td
+                                const td = el.closest && el.closest('td, th');
+                                if (td && td.nextElementSibling) {
+                                    const n = td.nextElementSibling;
+                                    const a = n.querySelector('a');
+                                    const v = clean(a ? text(a) : text(n));
+                                    if (v && !isLabelOnly(v)) return v;
+                                }
+                            }
+                            continue;
+                        }
+                        // "Sold by Name" in same node
+                        const m = t.match(/(?:sold by|shipper\\s*\\/\\s*seller)\\s*[:\\-]?\\s*(.+)$/i);
+                        if (m) {
+                            const v = clean(m[1]);
+                            if (v && !isLabelOnly(v)) return v;
+                        }
+                    }
+
+                    // 3) Classic soldBy containers
+                    const blocks = root.querySelectorAll(
+                        '[id="aod-offer-soldBy"], [id*="soldBy"], [id*="sold-by"], .aod-offer-seller'
+                    );
+                    for (const b of blocks) {
+                        const a = b.querySelector('a');
+                        if (a && text(a)) {
+                            const v = clean(text(a));
+                            if (v && !isLabelOnly(v)) return v;
+                        }
+                        const bt = text(b);
+                        if (isLabelOnly(bt) || /^shipper\\s*\\/\\s*seller/i.test(bt)) continue;
+                        const m = bt.match(/sold by\\s+(.+?)(?:\\s+\\d(?:\\.\\d)?\\s*out of|\\s+\\(?\\d|\\s*$)/i);
+                        if (m) {
+                            const v = clean(m[1]);
+                            if (v && !isLabelOnly(v)) return v;
+                        }
+                    }
+                    const full = text(root);
+                    const m2 = full.match(/sold by\\s+(.+?)(?:\\s+(?:fulfilled by|delivered by|ships from)|\\s+\\d(?:\\.\\d)?\\s*out of|\\s+Add to Cart|$)/i);
+                    if (m2) {
+                        const v = clean(m2[1]);
+                        if (v && !isLabelOnly(v)) return v;
+                    }
+                    // "Shipper / Seller Amazon.ae" or "Shipper / Seller Day To Day..."
+                    const m3 = full.match(/shipper\\s*\\/\\s*seller\\s+(.+?)(?:\\s+(?:fulfilled by|delivered by|ships from|add to cart)|$)/i);
+                    if (m3) {
+                        const v = clean(m3[1]);
+                        if (v && !isLabelOnly(v)) return v;
+                    }
+                    return null;
+                };
+                const parseShips = (root) => {
+                    const full = text(root);
+                    const m = full.match(/(?:ships from|delivered by|fulfilled by)\\s+(.+?)(?:\\s+sold by|\\s+Add to Cart|$)/i);
+                    if (m) return clean(m[1]);
+                    const el = root.querySelector('[id="aod-offer-shipsFrom"], [id*="shipsFrom"]');
+                    if (el) return clean(text(el));
+                    return null;
+                };
+                const parsePrice = (root) => {
+                    const off = root.querySelector('.a-price .a-offscreen, [id*="aod-price"] .a-offscreen, .aok-offscreen');
+                    if (off && text(off)) return text(off);
+                    const whole = root.querySelector('.a-price-whole');
+                    const frac = root.querySelector('.a-price-fraction');
+                    if (whole) {
+                        const w = text(whole).replace(/[^0-9]/g, '');
+                        const f = frac ? text(frac).replace(/[^0-9]/g, '') : '00';
+                        if (w) return w + '.' + (f || '00');
+                    }
+                    return null;
+                };
+
+                const offers = [];
+                const seen = new Set();
+                const pushOffer = (root, pinned) => {
+                    if (!root) return;
+                    const full = text(root);
+                    // Skip AOD table header rows that only say Shipper / Seller
+                    if (/shipper\\s*\\/\\s*seller/i.test(full) && full.length < 40 && !root.querySelector('.a-price, .a-price-whole')) {
+                        return;
+                    }
+                    const price = parsePrice(root);
+                    let seller = parseSoldBy(root);
+                    if (seller && isLabelOnly(seller)) seller = null;
+                    const ships = parseShips(root);
+                    if (!price && !seller) return;
+                    // Need a real merchant name or Amazon — never keep label text
+                    if (seller && /^shipper\\s*\\/\\s*seller/i.test(seller)) seller = null;
+                    const key = (seller || '') + '|' + (price || '') + '|' + (ships || '');
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    let fulfilled = null;
+                    if (/fulfilled by amazon|delivered by amazon/i.test(full)) {
+                        fulfilled = /amazon\\.ae/i.test(full) ? 'Amazon.ae' : 'Amazon';
+                    } else if (ships && !isLabelOnly(ships)) {
+                        fulfilled = ships;
+                    }
+                    offers.push({
+                        buybox_available: 'Yes',
+                        buybox_price: price,
+                        buybox_seller: seller,
+                        buybox_ships_from: (ships && !isLabelOnly(ships)) ? ships : null,
+                        buybox_fulfilled_by: fulfilled,
+                        buybox_condition: 'New',
+                        buybox_delivery: null,
+                        is_buybox_winner: pinned ? 'Yes' : 'No',
+                    });
+                };
+
+                pushOffer(document.querySelector('#aod-pinned-offer'), true);
+
+                document.querySelectorAll(
+                    '#aod-offer-list > div, #aod-offer, div.aod-offer'
+                ).forEach((el) => {
+                    if (el.id === 'aod-pinned-offer') return;
+                    const t = text(el);
+                    if (!el.querySelector('.a-price, .a-price-whole') && !/sold by/i.test(t)) return;
+                    if (t.length > 1200) return;
+                    pushOffer(el, false);
+                });
+
+                if (offers.filter(o => o.buybox_seller).length <= 1) {
+                    document.querySelectorAll('#aod-container div, #all-offers-display-scroller div, #aod-offer-list div').forEach((el) => {
+                        const t = text(el);
+                        if (!/sold by/i.test(t)) return;
+                        if (!el.querySelector('.a-price, .a-price-whole')) return;
+                        if (t.length < 40 || t.length > 700) return;
+                        pushOffer(el, false);
+                    });
+                }
+                return offers;
+            }"""
+        )
+    except Exception:
+        raw_list = []
+
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw_list, list):
+        return out
+    for raw in raw_list:
+        if isinstance(raw, dict):
+            out.append(_finalize_offer(raw))
+    return out
+
+
+async def open_all_buying_options(page: Page, domain: str, asin: str) -> bool:
+    """Open AOD / 'Other sellers on Amazon' so every seller offer can be scraped."""
+    for sel in [
+        "#buybox-see-all-buying-options-announce",
+        "a[href*='aod_']",
+        "span[data-action='show-all-offers-display'] a",
+        "a:has-text('See All Buying Options')",
+        "a:has-text('Other sellers')",
+        "a:has-text('New (')",
+        "#aod-ingress-link",
+        "a#aod-ingress-link",
+        "#olp-new a",
+        "#olpLinkWidget_feature_div a",
+        "a:has-text('New & Used')",
+        "a[href*='/gp/offer-listing/']",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=3000)
+                await asyncio.sleep(1.0)
+                try:
+                    await page.wait_for_selector(
+                        "#aod-offer, #aod-container, #aod-pinned-offer, #aod-offer-list, .aod-offer",
+                        timeout=8000,
+                    )
+                    await asyncio.sleep(0.5)
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    try:
+        for url in (
+            f"https://{domain}/gp/offer-listing/{asin}/ref=dp_olp_NEW_mbc?ie=UTF8&condition=new",
+            f"https://{domain}/dp/{asin}?th=1&psc=1&aod=1",
+        ):
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(0.8)
+            await _close_popups(page)
+            try:
+                ingress = page.locator("#aod-ingress-link, a:has-text('Other sellers')").first
+                if await ingress.count() and await ingress.is_visible():
+                    await ingress.click(timeout=3000)
+                    await asyncio.sleep(1.0)
+            except Exception:
+                pass
+            html = await page.content()
+            if "aod-offer" in html or "aod-offer-list" in html or "Sold by" in html:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+async def collect_all_offers(page: Page, domain: str, asin: str) -> list[dict[str, Any]]:
+    """Primary buy box + all other seller offers. Empty → caller fills 'no buybox'."""
+    offers: list[dict[str, Any]] = []
+    primary = await extract_buybox(page)
+    if primary.get("buybox_available") not in {"no buybox", "No", None} or primary.get(
+        "buybox_price"
+    ) or primary.get("buybox_seller"):
+        if primary.get("buybox_available") == "No" and not primary.get("buybox_price"):
+            pass
+        else:
+            if primary.get("buybox_available") == "No":
+                primary["buybox_available"] = "Yes"
+            primary["is_buybox_winner"] = "Yes"
+            offers.append(primary)
+
+    opened = await open_all_buying_options(page, domain, asin)
+    if opened:
+        more = await extract_aod_offers(page)
+        seen: set[tuple[str, str]] = set()
+        for o in offers:
+            seen.add(
+                (
+                    str(o.get("buybox_seller") or "").lower(),
+                    str(o.get("buybox_price") or ""),
+                )
+            )
+        for o in more:
+            seller = str(o.get("buybox_seller") or "").lower()
+            price = str(o.get("buybox_price") or "")
+            key = (seller, price)
+            if seller and key in seen:
+                continue
+            if not seller and any(s == "" and p == price for s, p in seen):
+                continue
+            seen.add(key)
+            o["is_buybox_winner"] = "No" if offers else (o.get("is_buybox_winner") or "No")
+            offers.append(o)
+
+    if offers and not any(str(o.get("is_buybox_winner")) == "Yes" for o in offers):
+        offers[0]["is_buybox_winner"] = "Yes"
+
+    named = sum(1 for o in offers if o.get("buybox_seller"))
+    print(f"[BUYBOX] offers={len(offers)} with_seller_name={named}")
+    return offers
+
+
+def is_asin_not_found(
+    html: str,
+    page_title: str = "",
+    page_url: str = "",
+    http_status: int | None = None,
+) -> bool:
+    """True when Amazon shows the classic missing-product / 404 dog page."""
+    if http_status == 404:
+        return True
+    title = (page_title or "").lower()
+    url = (page_url or "").lower()
+    if "page not found" in title:
+        return True
+    if "sorry" in title and "find" in title:
+        return True
+    lower = (html or "").lower()
+    markers = [
+        "sorry we couldn't find that page",
+        "sorry! we couldn't find that page",
+        "we couldn't find that page",
+        "looking for something?",
+        "dogs of amazon",
+        "/gp/errors/404",
+        "page-not-found",
+        "the web address you entered is not a functioning page",
+    ]
+    if any(m in lower for m in markers):
+        return True
+    if "dp/" in url and "producttitle" not in lower and "couldn't find that page" in lower:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Challenge / captcha
+# ---------------------------------------------------------------------------
+
+
+def is_challenge_html(html: str, page_title: str = "") -> bool:
+    title = (page_title or "").lower()
+    if "robot check" in title or "amazon.com/errors" in title:
+        return True
+    if "sorry! something went wrong" in title and "amazon" in title:
+        return True
+    lower = html.lower()
+    markers = [
+        "enter the characters you see below",
+        "type the characters you see in this image",
+        "api-services-support@amazon.com",
+        "validatecaptcha",
+        "/errors/validatecaptcha",
+        "opfcaptcha.amazon",
+        "automated access to amazon",
+    ]
+    return any(m in lower for m in markers)
+
+
+def is_wrong_marketplace(page_url: str, expected_domain: str) -> str | None:
+    """Detect redirect to another Amazon TLD (common from India → amazon.in)."""
+    u = (page_url or "").lower()
+    expected = expected_domain.lower().replace("www.", "")
+    m = re.search(r"https?://(?:www\.)?(amazon\.[a-z0-9.]+)", u)
+    if not m:
+        return None
+    landed = m.group(1).replace("www.", "")
+    if landed == expected:
+        return None
+    return landed
+
+
+async def wait_out_challenge(page: Page, seconds: int) -> bool:
+    if seconds <= 0:
+        return False
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        html = await page.content()
+        title = await page.title()
+        if not is_challenge_html(html, title):
+            return True
+        await asyncio.sleep(2.0)
+    return False
+
+
+async def auto_warmup(page: Page, domain: str, marketplace: str) -> bool:
+    """Silent headless warmup — no browser UI, no ENTER prompt."""
+    home = f"https://{domain}/"
+    print(f"[WARMUP] Headless check → {home}")
+    try:
+        await page.goto(home, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(1.5)
+        await _close_popups(page)
+    except Exception as e:
+        print(f"[WARMUP] Could not open Amazon: {e}")
+        return False
+
+    html = await page.content()
+    title = await page.title()
+    wrong = is_wrong_marketplace(page.url, domain)
+    if wrong:
+        print(f"[WARMUP] Redirected to {wrong} (wanted {domain}).")
+        print("[WARMUP] Your IP looks Indian / wrong geo. Set a matching residential proxy.")
+        return False
+    if is_challenge_html(html, title):
+        print("[WARMUP] Captcha / robot check on homepage.")
+        print("[WARMUP] Stopping early to protect your IP. Fix proxy / wait and retry later.")
+        return False
+
+    print(f"[WARMUP] OK — Amazon {marketplace.upper()} reachable headlessly.\n")
+    return True
+
+
+async def manual_warmup(page: Page, domain: str, marketplace: str) -> bool:
+    if not config.MANUAL_WARMUP:
+        return await auto_warmup(page, domain, marketplace)
+
+    home = f"https://{domain}/"
+    print("\n" + "=" * 62)
+    if config.CONNECT_EXISTING_CHROME:
+        print("WARMUP: Use Chrome opened by start_chrome.bat (NOT Playwright Chrome).")
+        print(f"  1) Double-click amazon/start_chrome.bat")
+        print(f"  2) In that Chrome, open {home}")
+        print("  3) Complete captcha / continue shopping if shown")
+        print("  4) Come back here and press ENTER")
+    else:
+        print(f"WARMUP: Complete Amazon ({marketplace.upper()}) captcha, then press ENTER.")
+    print("=" * 62)
+
+    try:
+        await page.goto(home, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        print(f"[WARMUP] Could not open Amazon: {e}")
+
+    await asyncio.to_thread(
+        input,
+        f"\nPress ENTER when {marketplace.upper()} Amazon homepage is open (no captcha)... ",
+    )
+
+    html = await page.content()
+    title = await page.title()
+    if is_challenge_html(html, title):
+        print("[WARMUP] Still on captcha / robot check. Captcha did NOT pass.")
+        print("[WARMUP] Use amazon/start_chrome.bat, pass captcha, then run again.")
+        return False
+
+    print(f"[WARMUP] OK — Amazon {marketplace.upper()} session looks good. Starting scrape...\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# DOM helpers / extraction
+# ---------------------------------------------------------------------------
+
+
+async def _close_popups(page: Page) -> None:
+    for sel in [
+        'input[name="accept"]',
+        '#sp-cc-accept',
+        'button:has-text("Accept")',
+        'button:has-text("Accept Cookies")',
+        'button:has-text("Continue shopping")',
+        'input[data-action-type="DISMISS"]',
+        '#nav-main #nav-flyout-aya span.close',
+        'button[aria-label="Close"]',
+        'button:has-text("Dismiss")',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() and await btn.is_visible():
+                await btn.click(timeout=1500)
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+
+async def _text(page: Page, selectors: list[str], timeout: int = 2500) -> str | None:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                t = (await loc.inner_text(timeout=timeout)).strip()
+                if t:
+                    return re.sub(r"\s+", " ", t)
+        except Exception:
+            continue
+    return None
+
+
+async def _attr(page: Page, selectors: list[str], attr: str) -> str | None:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                v = await loc.get_attribute(attr)
+                if v and v.strip():
+                    return v.strip()
+        except Exception:
+            continue
+    return None
+
+
+def _as_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_json_ld(html: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.I | re.S,
+    ):
+        raw = m.group(1).strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if not any(str(x).lower() == "product" for x in types if x):
+                continue
+            out["title"] = out.get("title") or _as_text(item.get("name"))
+            brand = item.get("brand")
+            if isinstance(brand, dict):
+                out["brand"] = out.get("brand") or _as_text(brand.get("name"))
+            else:
+                out["brand"] = out.get("brand") or _as_text(brand)
+            out["description"] = out.get("description") or _as_text(item.get("description"))
+            img = item.get("image")
+            if isinstance(img, list) and img:
+                out["image_url"] = out.get("image_url") or _as_text(img[0])
+            else:
+                out["image_url"] = out.get("image_url") or _as_text(img)
+            offers = item.get("offers")
+            if isinstance(offers, list) and offers:
+                offers = offers[0]
+            if isinstance(offers, dict):
+                out["price"] = out.get("price") or _clean_price(_as_text(offers.get("price")))
+                out["currency"] = out.get("currency") or _as_text(offers.get("priceCurrency"))
+                out["availability"] = out.get("availability") or _as_text(
+                    str(offers.get("availability", "")).split("/")[-1]
+                )
+            agg = item.get("aggregateRating")
+            if isinstance(agg, dict):
+                out["rating"] = out.get("rating") or _as_text(agg.get("ratingValue"))
+                out["reviews_count"] = out.get("reviews_count") or _as_text(
+                    agg.get("reviewCount") or agg.get("ratingCount")
+                )
+    return out
+
+
+def _clean_price(text: str | None) -> str | None:
+    """Normalize Amazon price text to a plain number string like 9.52."""
+    if not text:
+        return None
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    # Keep currency symbol optional in output — strip for parsing
+    m = re.search(
+        r"(?:USD|CAD|GBP|EUR|\$|£|€)\s*([\d.,]+)|([\d.,]+)\s*(?:USD|CAD|GBP|EUR)|([\d.,]+)",
+        t,
+        re.I,
+    )
+    if not m:
+        return None
+    raw = next(g for g in m.groups() if g)
+    raw = raw.strip()
+
+    # Both separators: decide decimal by last one
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            # 1.234,56 (EU)
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            # 1,234.56 (US)
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        parts = raw.split(",")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            # 1,14 → 1.14
+            raw = parts[0] + "." + parts[1]
+        else:
+            raw = raw.replace(",", "")
+
+    # Guard: "9 52" style from whole+fraction without separator
+    if " " in raw:
+        bits = raw.split()
+        if len(bits) == 2 and bits[0].isdigit() and bits[1].isdigit():
+            raw = f"{bits[0]}.{bits[1]}"
+
+    if not re.search(r"\d", raw):
+        return None
+    return raw
+
+
+async def _extract_main_price(page: Page) -> str | None:
+    """Read buy-box price via a-offscreen or whole+fraction (avoids 952 style concat bugs)."""
+    try:
+        raw = await page.evaluate(
+            """() => {
+                const roots = [
+                    '#corePrice_feature_div',
+                    '#corePriceDisplay_desktop_feature_div',
+                    '#apex_desktop',
+                    '#tp_price_block_total_price_ww',
+                    '#price',
+                    '#price_inside_buybox',
+                ];
+                for (const sel of roots) {
+                    const box = document.querySelector(sel);
+                    if (!box) continue;
+                    const off = box.querySelector('.a-price:not(.a-text-price) span.a-offscreen');
+                    if (off && off.textContent && off.textContent.trim()) {
+                        return off.textContent.trim();
+                    }
+                    const whole = box.querySelector('.a-price:not(.a-text-price) .a-price-whole');
+                    const frac = box.querySelector('.a-price:not(.a-text-price) .a-price-fraction');
+                    if (whole) {
+                        const w = (whole.textContent || '').replace(/[^0-9]/g, '');
+                        const f = frac
+                            ? (frac.textContent || '').replace(/[^0-9]/g, '')
+                            : '00';
+                        if (w) return w + '.' + (f || '00');
+                    }
+                }
+                // last resort: any primary offscreen price
+                const any = document.querySelector(
+                    'span.a-price.aok-align-center span.a-offscreen, #priceblock_ourprice, #priceblock_dealprice'
+                );
+                return any && any.textContent ? any.textContent.trim() : null;
+            }"""
+        )
+        return _clean_price(raw)
+    except Exception:
+        return None
+
+
+async def _extract_was_price(page: Page) -> str | None:
+    try:
+        raw = await page.evaluate(
+            """() => {
+                const roots = [
+                    '#corePriceDisplay_desktop_feature_div',
+                    '#corePrice_feature_div',
+                    '#apex_desktop',
+                ];
+                for (const sel of roots) {
+                    const box = document.querySelector(sel);
+                    if (!box) continue;
+                    const off = box.querySelector(
+                        'span.a-price.a-text-price[data-a-strike="true"] span.a-offscreen, span.a-price.a-text-price span.a-offscreen'
+                    );
+                    if (off && off.textContent && off.textContent.trim()) {
+                        return off.textContent.trim();
+                    }
+                }
+                const lp = document.querySelector('#listPrice, #priceblock_listprice');
+                return lp && lp.textContent ? lp.textContent.trim() : null;
+            }"""
+        )
+        return _clean_price(raw)
+    except Exception:
+        return None
+
+
+async def set_delivery_postal(page: Page, marketplace: str, domain: str) -> bool:
+    """
+    Set Amazon delivery ZIP/postal so prices show for that country.
+    From India, without this many US items say 'cannot be shipped' and hide price.
+    """
+    postal_map = getattr(config, "DELIVERY_POSTAL", {}) or {}
+    postal = postal_map.get(marketplace) or postal_map.get(marketplace.lower())
+    if not postal:
+        print("[LOC] No DELIVERY_POSTAL configured — skipping location set.")
+        return False
+
+    print(f"[LOC] Setting delivery location to {postal!r} on {domain} ...")
+    try:
+        await page.goto(f"https://{domain}/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(1.0)
+        await _close_popups(page)
+
+        # Open location popover
+        opened = False
+        for sel in [
+            "#nav-global-location-popover-link",
+            "#glow-ingress-block",
+            "#nav-global-location-slot",
+            "#glow-ingress-line2",
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.click(timeout=4000)
+                    opened = True
+                    await asyncio.sleep(1.2)
+                    break
+            except Exception:
+                continue
+
+        if not opened:
+            print("[LOC] Could not open delivery location UI.")
+            return False
+
+        # Fill ZIP / postal
+        filled = False
+        for sel in [
+            "#GLUXZipUpdateInput",
+            "input[name='glowZipCode']",
+            "input[data-action='GLUXPostalInputAction']",
+            "#GLUXZipInput",
+            "input[aria-label*='zip' i]",
+            "input[aria-label*='postal' i]",
+        ]:
+            try:
+                inp = page.locator(sel).first
+                if await inp.count() and await inp.is_visible():
+                    await inp.click(timeout=2000)
+                    await inp.fill("")
+                    await inp.fill(str(postal))
+                    filled = True
+                    await asyncio.sleep(0.4)
+                    break
+            except Exception:
+                continue
+
+        if not filled:
+            print("[LOC] ZIP/postal input not found (layout may differ).")
+            return False
+
+        # Apply
+        applied = False
+        for sel in [
+            "#GLUXZipUpdate",
+            "input[aria-labelledby='GLUXZipUpdate-announce']",
+            "span#GLUXZipUpdate span.a-button-text",
+            "input[type='submit'][aria-labelledby*='GLUXZipUpdate']",
+            "button:has-text('Apply')",
+            "span.a-button-text:has-text('Apply')",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(timeout=3000)
+                    applied = True
+                    await asyncio.sleep(1.5)
+                    break
+            except Exception:
+                continue
+
+        # Confirm / Done if a second dialog appears
+        for sel in [
+            "#GLUXConfirmClose",
+            "button[name='glowDoneButton']",
+            "button:has-text('Done')",
+            "button:has-text('Continue')",
+            ".a-popover-footer button",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(timeout=2000)
+                    await asyncio.sleep(0.8)
+                    break
+            except Exception:
+                pass
+
+        # Change zip via Enter if Apply didn't click
+        if not applied:
+            try:
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+        print(f"[LOC] Delivery location set attempt finished ({postal}).")
+        return True
+    except Exception as e:
+        print(f"[LOC] Failed to set location: {e}")
+        return False
+
+
+async def expand_product_information_sections(page: Page) -> None:
+    """Open Product information / detail accordions so all tables are in the DOM."""
+    for sel in [
+        "#productDetails_db_sections",
+        "#detailBulletsWrapper_feature_div",
+        "#productDetails_feature_div",
+        "a:has-text('See more product details')",
+        "a:has-text('See all details')",
+        "span:has-text('Product information')",
+        "#nic-po-expander-heading",
+        "[data-action='a-expander-toggle']",
+    ]:
+        try:
+            locs = page.locator(sel)
+            n = min(await locs.count(), 8)
+            for i in range(n):
+                el = locs.nth(i)
+                if await el.is_visible():
+                    await el.click(timeout=1500)
+                    await asyncio.sleep(0.2)
+        except Exception:
+            continue
+
+    # Click section headers like Item details / Style / Materials
+    for label in (
+        "Item details",
+        "Style",
+        "Materials & Care",
+        "Measurements",
+        "Features & Specs",
+        "Product details",
+        "Technical Details",
+        "Additional Information",
+    ):
+        try:
+            hdr = page.get_by_role("button", name=re.compile(label, re.I)).first
+            if await hdr.count() and await hdr.is_visible():
+                await hdr.click(timeout=1500)
+                await asyncio.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            hdr2 = page.locator(f"text={label}").first
+            if await hdr2.count() and await hdr2.is_visible():
+                await hdr2.click(timeout=1500)
+                await asyncio.sleep(0.15)
+        except Exception:
+            pass
+
+
+def _map_product_detail_label(label: str) -> str | None:
+    key = re.sub(r"\s+", " ", (label or "").strip().lower())
+    key = key.rstrip(":")
+    return PRODUCT_DETAIL_LABEL_MAP.get(key)
+
+
+async def extract_product_information(page: Page) -> dict[str, Any]:
+    """
+    Scrape Amazon 'Product information' tables (Item details, Style,
+    Materials & Care, Measurements, Features & Specs) plus classic detail bullets.
+    """
+    await expand_product_information_sections(page)
+
+    try:
+        raw_pairs = await page.evaluate(
+            """() => {
+                const pairs = [];
+                const push = (k, v) => {
+                    if (!k || !v) return;
+                    const key = String(k).replace(/\\s+/g, ' ').trim().replace(/:$/, '');
+                    const val = String(v).replace(/\\s+/g, ' ').trim();
+                    if (!key || !val) return;
+                    if (key.length > 120) return;
+                    pairs.push([key, val]);
+                };
+
+                // Newer Product information layout (expando / po tables)
+                document.querySelectorAll(
+                    '#productDetails_techSpec_section_1 tr, #productDetails_techSpec_section_2 tr, #productDetails_detailBullets_sections1 tr, #prodDetails tr, table.a-keyvalue tr, .prodDetTable tr, #productDetails_db_sections tr'
+                ).forEach((tr) => {
+                    const th = tr.querySelector('th, td.prodDetSectionEntry, .a-span3');
+                    const td = tr.querySelector('td.prodDetAttrValue, td:not(.prodDetSectionEntry), .a-span9');
+                    if (th && td) push(th.innerText, td.innerText);
+                });
+
+                // Detail bullets: "Label: Value"
+                document.querySelectorAll(
+                    '#detailBullets_feature_div li, #detailBulletsWrapper_feature_div li, #productDetails_detailBullets_sections1 li'
+                ).forEach((li) => {
+                    const t = (li.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const m = t.match(/^([^:]+):\\s*(.+)$/);
+                    if (m) push(m[1], m[2]);
+                });
+
+                // Attribute expander / "Item details" style grids
+                document.querySelectorAll(
+                    '[data-cel-widget*="product-facts"] .a-spacing-small, .product-facts-detail, .a-section.a-spacing-small .a-fixed-left-grid'
+                ).forEach((row) => {
+                    const label = row.querySelector('.a-col-left, .a-text-bold, .rpi-attribute-label');
+                    const value = row.querySelector('.a-col-right, .rpi-attribute-value, .a-color-base');
+                    if (label && value) push(label.innerText, value.innerText);
+                });
+
+                // Generic fact rows in expandable product info
+                document.querySelectorAll(
+                    '#nic-po-expander-content tr, #poExpander tr, #productOverview_feature_div tr, #technicalSpecifications_feature_div tr'
+                ).forEach((tr) => {
+                    const cells = tr.querySelectorAll('td, th');
+                    if (cells.length >= 2) push(cells[0].innerText, cells[1].innerText);
+                });
+
+                // po-attribute / overview attribute list
+                document.querySelectorAll(
+                    '#productOverview_feature_div .a-spacing-small, table.a-normal.a-spacing-micro tr'
+                ).forEach((row) => {
+                    const label = row.querySelector('td.a-span3, td:first-child');
+                    const value = row.querySelector('td.a-span9, td:last-child');
+                    if (label && value && label !== value) push(label.innerText, value.innerText);
+                });
+
+                return pairs;
+            }"""
+        )
+    except Exception:
+        raw_pairs = []
+
+    out: dict[str, Any] = {}
+    all_raw: list[str] = []
+    if not isinstance(raw_pairs, list):
+        return out
+
+    for item in raw_pairs:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        label, value = str(item[0]), str(item[1])
+        label = re.sub(r"\s+", " ", label).strip().rstrip(":")
+        value = re.sub(r"\s+", " ", value).strip()
+        if not label or not value:
+            continue
+        # Skip junk
+        if label.lower() in {"customer reviews"} and "out of" in value.lower():
+            # Prefer structured rating columns; still keep text in raw
+            all_raw.append(f"{label}: {value}")
+            m = re.search(r"([\d.]+)\s*out of\s*5", value, re.I)
+            if m and not out.get("rating"):
+                out["rating"] = m.group(1)
+            m2 = re.search(r"([\d,]+)\s*rating", value, re.I)
+            if m2 and not out.get("reviews_count"):
+                out["reviews_count"] = m2.group(1).replace(",", "")
+            continue
+
+        all_raw.append(f"{label}: {value}")
+        col = _map_product_detail_label(label)
+        if not col:
+            continue
+        if col == "asin":
+            # don't overwrite job asin unless empty — scrape_amazon sets it
+            if not out.get("asin"):
+                out["asin"] = value
+            continue
+        if col == "customer_reviews_text":
+            continue
+        if col not in out or not out[col]:
+            out[col] = value
+
+    if all_raw:
+        # De-dupe while preserving order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for line in all_raw:
+            if line not in seen:
+                seen.add(line)
+                uniq.append(line)
+        out["product_details_raw"] = " | ".join(uniq[:80])
+
+    return out
+
+
+async def extract_from_dom(page: Page) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+
+    data["title"] = await _text(
+        page,
+        ["#productTitle", "#title", "span#title", "h1 span#productTitle"],
+    )
+    data["brand"] = await _text(
+        page,
+        [
+            "#bylineInfo",
+            "a#bylineInfo",
+            "#brand",
+            "tr.po-brand td.a-span9 span",
+            "a#brand",
+        ],
+    )
+    if data.get("brand"):
+        data["brand"] = re.sub(
+            r"^(Visit the|Brand:|Store:)\s*", "", data["brand"], flags=re.I
+        ).strip()
+        data["brand"] = re.sub(r"\s+Store$", "", data["brand"], flags=re.I).strip()
+
+    data["price"] = await _extract_main_price(page)
+    data["was_price"] = await _extract_was_price(page)
+
+    data["availability"] = await _text(
+        page,
+        [
+            "#availability span",
+            "#availability",
+            "#outOfStock",
+            "#availability_feature_div",
+        ],
+    )
+
+    rating = await _attr(page, ["span.a-icon-alt", "#acrPopover"], "title")
+    if not rating:
+        rating = await _text(page, ["span[data-hook='rating-out-of-text']", "#acrPopover span.a-size-base"])
+    if rating:
+        m = re.search(r"([\d.]+)\s*out of", rating, re.I)
+        data["rating"] = m.group(1) if m else rating
+
+    reviews = await _text(
+        page,
+        [
+            "#acrCustomerReviewText",
+            "span[data-hook='total-review-count']",
+            "#averageCustomerReviews span#acrCustomerReviewText",
+        ],
+    )
+    if reviews:
+        m = re.search(r"([\d,]+)", reviews)
+        data["reviews_count"] = m.group(1).replace(",", "") if m else reviews
+
+    crumbs = await _text(
+        page,
+        ["#wayfinding-breadcrumbs_feature_div", "#wayfinding-breadcrumbs_container"],
+    )
+    data["category"] = crumbs
+
+    # Bullet features
+    try:
+        bullets = page.locator("#feature-bullets ul li span.a-list-item")
+        n = await bullets.count()
+        feats: list[str] = []
+        for i in range(min(n, 12)):
+            t = (await bullets.nth(i).inner_text()).strip()
+            t = re.sub(r"\s+", " ", t)
+            if t and len(t) > 2:
+                feats.append(t)
+        if feats:
+            data["features"] = " | ".join(feats)
+    except Exception:
+        pass
+
+    data["description"] = await _text(
+        page,
+        [
+            "#productDescription p",
+            "#productDescription",
+            "#aplus_feature_div",
+            "#bookDescription_feature_div",
+        ],
+    )
+
+    data["image_url"] = await _attr(
+        page,
+        ["#landingImage", "#imgTagWrapperId img", "#main-image", "img#imgBlkFront"],
+        "src",
+    )
+    if not data.get("image_url"):
+        data["image_url"] = await _attr(
+            page,
+            ["#landingImage", "#imgTagWrapperId img"],
+            "data-old-hires",
+        )
+
+    data["seller"] = await _text(
+        page,
+        [
+            "#sellerProfileTriggerId",
+            "a#sellerProfileTriggerId",
+            "#merchant-info",
+            "div#merchant-info",
+            "span.offer-display-feature-text",
+        ],
+    )
+    data["ships_from"] = await _text(
+        page,
+        [
+            "div[tabular-attribute-name='Ships from'] span",
+            "#fulfillerInfoFeature_feature_div",
+            "#mir-layout-DELIVERY_BLOCK",
+        ],
+    )
+
+    # Primary buy box only here; full multi-offer list collected later
+    buybox = await extract_buybox(page)
+    data.update(buybox)
+    if buybox.get("buybox_seller") and not data.get("seller"):
+        data["seller"] = buybox["buybox_seller"]
+    if buybox.get("buybox_ships_from") and not data.get("ships_from"):
+        data["ships_from"] = buybox["buybox_ships_from"]
+    if buybox.get("buybox_price") and not data.get("price"):
+        data["price"] = buybox["buybox_price"]
+
+    # Full Product information tables (Item details / Style / Materials / etc.)
+    details = await extract_product_information(page)
+    for k, v in details.items():
+        if v and (k not in data or not data.get(k)):
+            data[k] = v
+        elif k == "product_details_raw" and v:
+            data[k] = v
+
+    return {k: v for k, v in data.items() if v}
+
+
+def empty_row(asin: str, marketplace: str, url: str) -> dict[str, Any]:
+    row = {c: None for c in COLUMNS}
+    row["asin"] = asin
+    row["marketplace"] = marketplace
+    row["url"] = url
+    row["scraped_at"] = datetime.now(timezone.utc).isoformat()
+    row["status"] = "Pending"
+    return row
+
+
+def _rows_from_offers(
+    base: dict[str, Any], offers: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One Excel row per offer. If none → single row with 'no buybox'."""
+    if not offers:
+        row = dict(base)
+        row["offer_index"] = 1
+        row["offer_count"] = 0
+        row["is_buybox_winner"] = "No"
+        row["buybox_available"] = "no buybox"
+        row["buybox_price"] = None
+        row["buybox_seller"] = None
+        row["buybox_ships_from"] = None
+        row["buybox_fulfilled_by"] = None
+        row["buybox_is_amazon"] = None
+        row["buybox_condition"] = None
+        row["buybox_delivery"] = None
+        return [row]
+
+    rows: list[dict[str, Any]] = []
+    count = len(offers)
+    for i, offer in enumerate(offers, start=1):
+        row = dict(base)
+        row["offer_index"] = i
+        row["offer_count"] = count
+        row["is_buybox_winner"] = offer.get("is_buybox_winner") or ("Yes" if i == 1 else "No")
+        for key in [
+            "buybox_available",
+            "buybox_price",
+            "buybox_seller",
+            "buybox_ships_from",
+            "buybox_fulfilled_by",
+            "buybox_is_amazon",
+            "buybox_condition",
+            "buybox_delivery",
+        ]:
+            if offer.get(key) is not None:
+                row[key] = offer.get(key)
+        if offer.get("buybox_seller"):
+            row["seller"] = offer["buybox_seller"]
+        if offer.get("buybox_ships_from"):
+            row["ships_from"] = offer["buybox_ships_from"]
+        if offer.get("buybox_price") and i == 1:
+            row["price"] = offer["buybox_price"]
+        rows.append(row)
+    return rows
+
+
+async def scrape_amazon_asin(
+    page: Page,
+    asin: str,
+    marketplace: str,
+    mcfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Scrape product + ALL buy box / seller offers. Returns one or more Excel rows."""
+    url = product_url(mcfg["domain"], asin)
+    base = empty_row(asin, marketplace, url)
+    base["currency"] = mcfg.get("currency")
+
+    try:
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        base["http_status"] = resp.status if resp else None
+        settle = float(getattr(config, "PAGE_SETTLE_SECONDS", 0.5) or 0.5)
+        await asyncio.sleep(settle)
+        await _close_popups(page)
+
+        html = await page.content()
+        title = await page.title()
+
+        if is_asin_not_found(html, title, page.url, base.get("http_status")):
+            base["status"] = "Skip"
+            base["error"] = "ASIN not found on Amazon (404 / page missing) — skipped"
+            base["title"] = None
+            base["buybox_available"] = "no buybox"
+            base["offer_index"] = 1
+            base["offer_count"] = 0
+            base["is_buybox_winner"] = "No"
+            print(f"[SKIP] {asin} — page not found. Marked Skip, continuing next ASIN.")
+            base["scraped_at"] = datetime.now(timezone.utc).isoformat()
+            return [base]
+
+        wrong = is_wrong_marketplace(page.url, mcfg["domain"])
+        if wrong:
+            base["status"] = "Blocked"
+            base["error"] = f"Redirected to {wrong} (wanted {mcfg['domain']}) — wrong geo / need proxy"
+            base["buybox_available"] = "no buybox"
+            print(f"[GEO] {asin} redirected to {wrong}. Stopping retries for this ASIN.")
+            return [base]
+
+        if is_challenge_html(html, title):
+            wait_s = int(getattr(config, "CAPTCHA_WAIT_SECONDS", 0) or 0)
+            if wait_s > 0:
+                print(f"[CAPTCHA] Robot check for {asin}. Waiting up to {wait_s}s...")
+                ok = await wait_out_challenge(page, wait_s)
+                if not ok:
+                    base["status"] = "Blocked"
+                    base["error"] = "Amazon captcha / robot check"
+                    base["buybox_available"] = "no buybox"
+                    return [base]
+                html = await page.content()
+                title = await page.title()
+                if is_asin_not_found(html, title, page.url, base.get("http_status")):
+                    base["status"] = "Skip"
+                    base["error"] = "ASIN not found on Amazon (404 / page missing) — skipped"
+                    base["buybox_available"] = "no buybox"
+                    print(f"[SKIP] {asin} — page not found after captcha. Continuing.")
+                    base["scraped_at"] = datetime.now(timezone.utc).isoformat()
+                    return [base]
+            else:
+                print(f"[CAPTCHA] Robot check for {asin} — fail-fast (headless, no wait).")
+                base["status"] = "Blocked"
+                base["error"] = "Amazon captcha / robot check"
+                base["buybox_available"] = "no buybox"
+                return [base]
+
+        # Soft wait for title (don't burn 12s if already there)
+        try:
+            await page.wait_for_selector("#productTitle, #title", timeout=5000)
+        except Exception:
+            pass
+
+        html = await page.content()
+        title = await page.title()
+
+        if is_asin_not_found(html, title, page.url, base.get("http_status")):
+            base["status"] = "Skip"
+            base["error"] = "ASIN not found on Amazon (404 / page missing) — skipped"
+            base["buybox_available"] = "no buybox"
+            print(f"[SKIP] {asin} — page not found. Marked Skip, continuing next ASIN.")
+            base["scraped_at"] = datetime.now(timezone.utc).isoformat()
+            return [base]
+
+        parsed = _parse_json_ld(html)
+        # Product fields only (not multi-offer yet)
+        dom = await extract_from_dom(page)
+        parsed.update({k: v for k, v in dom.items() if v})
+
+        for key in [
+            "title",
+            "brand",
+            "price",
+            "was_price",
+            "currency",
+            "availability",
+            "rating",
+            "reviews_count",
+            "category",
+            "recommended_uses",
+            "number_of_pieces",
+            "included_components",
+            "item_type_name",
+            "reusability",
+            "gtin",
+            "manufacturer",
+            "upc",
+            "item_highlight",
+            "unit_count",
+            "model_number",
+            "manufacturer_part_number",
+            "best_sellers_rank",
+            "color",
+            "style_name",
+            "shape",
+            "pattern",
+            "finish_types",
+            "theme",
+            "occasion_type",
+            "seasons",
+            "material_type",
+            "product_care_instructions",
+            "material_features",
+            "item_dimensions",
+            "size",
+            "item_weight",
+            "net_content_weight",
+            "special_features",
+            "product_details_raw",
+            "features",
+            "description",
+            "image_url",
+            "seller",
+            "ships_from",
+        ]:
+            if parsed.get(key):
+                base[key] = parsed[key]
+
+        if not base.get("currency"):
+            base["currency"] = mcfg.get("currency")
+
+        lower_title = (base.get("title") or title or "").lower()
+        if is_asin_not_found(html, lower_title, page.url, base.get("http_status")):
+            base["status"] = "Skip"
+            base["error"] = "ASIN not found on Amazon (404 / page missing) — skipped"
+            base["title"] = None
+            base["buybox_available"] = "no buybox"
+            print(f"[SKIP] {asin} — page not found. Marked Skip, continuing next ASIN.")
+            base["scraped_at"] = datetime.now(timezone.utc).isoformat()
+            return [base]
+
+        # Collect ALL offers from current product page (no second full reload)
+        offers = await collect_all_offers(page, mcfg["domain"], asin)
+        rows = _rows_from_offers(base, offers)
+
+        if base.get("title"):
+            for row in rows:
+                row["status"] = "Success"
+                row["error"] = None
+                row["scraped_at"] = datetime.now(timezone.utc).isoformat()
+            bb_note = rows[0].get("buybox_available")
+            print(
+                f"[OK] {asin} | offers={len(offers) or 0} | "
+                f"buybox={bb_note} | {(base.get('title') or '')[:50]}"
+            )
+        else:
+            for row in rows:
+                row["status"] = "Failed"
+                row["error"] = "Title not found (page may be blocked or layout changed)"
+                row["buybox_available"] = row.get("buybox_available") or "no buybox"
+                row["scraped_at"] = datetime.now(timezone.utc).isoformat()
+            print(f"[FAIL] {asin} — no title (page title: {title[:80]!r})")
+
+        return rows
+
+    except Exception as e:
+        base["status"] = "Error"
+        base["error"] = str(e)[:300]
+        base["buybox_available"] = "no buybox"
+        base["offer_index"] = 1
+        base["offer_count"] = 0
+        base["scraped_at"] = datetime.now(timezone.utc).isoformat()
+        print(f"[ERROR] {asin}: {e}")
+        return [base]
+
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+
+
+def find_chrome_executable() -> Path | None:
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def debug_port_open() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", config.CHROME_DEBUG_PORT), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def launch_debug_chrome(domain: str) -> None:
+    chrome = find_chrome_executable()
+    if not chrome:
+        raise FileNotFoundError(
+            "Google Chrome not found. Install Chrome or set Chrome path manually."
+        )
+
+    profile = Path(config.USER_DATA_DIR).resolve()
+    profile.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(chrome),
+        f"--remote-debugging-port={config.CHROME_DEBUG_PORT}",
+        f"--user-data-dir={profile}",
+        f"https://{domain}/",
+    ]
+    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {config.CHROME_DEBUG_PORT})")
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+
+async def wait_for_debug_port(seconds: int = 45) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if debug_port_open():
+            return True
+        await asyncio.sleep(0.75)
+    return False
+
+
+async def connect_existing_chrome(
+    p, domain: str
+) -> tuple[Browser, BrowserContext, Page, bool]:
+    print(f"[BROWSER] Connecting to {config.CHROME_DEBUG_URL} ...")
+
+    if not debug_port_open() and config.AUTO_LAUNCH_CHROME:
+        print("[BROWSER] Chrome debug port not open — launching Chrome now...")
+        try:
+            launch_debug_chrome(domain)
+        except Exception as e:
+            print(f"[BROWSER] Could not launch Chrome: {e}")
+            print("[BROWSER] Or double-click amazon/start_chrome.bat manually.")
+            raise SystemExit(1) from e
+        print("[BROWSER] Waiting for Chrome to start...")
+        if not await wait_for_debug_port(45):
+            print("[BROWSER] Chrome did not open debug port in time.")
+            raise SystemExit(1)
+
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+            print("[BROWSER] Connected to Chrome.")
+            return browser, context, page, True
+        except Exception as e:
+            last_error = e
+            if attempt < 5:
+                await asyncio.sleep(1.5)
+
+    print(f"[BROWSER] Could not connect: {last_error}")
+    print("[BROWSER] Fix: close Chrome, run amazon/start_chrome.bat, then retry.")
+    raise SystemExit(1) from last_error
+
+
+async def create_context(
+    p, mcfg: dict[str, Any], proxy: dict[str, str] | None = None
+) -> tuple[BrowserContext, Page, Browser | None, bool]:
+    profile = Path(config.USER_DATA_DIR)
+    # Separate profile per marketplace so cookies/locale don't bleed across geos
+    marketplace_key = next(
+        (k for k, v in config.MARKETPLACES.items() if v.get("domain") == mcfg.get("domain")),
+        "default",
+    )
+    profile = profile / marketplace_key
+    profile.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+    ]
+    if config.HEADLESS:
+        args.append("--headless=new")
+    if config.HIDE_BROWSER_WINDOW and not config.HEADLESS:
+        args.extend(["--window-position=-32000,-32000", "--start-minimized"])
+
+    ua = random.choice(config.USER_AGENTS)
+
+    launch_kwargs: dict[str, Any] = {
+        "user_data_dir": str(profile.resolve()),
+        "headless": config.HEADLESS,
+        "slow_mo": config.SLOW_MO_MS,
+        "args": args,
+        "ignore_default_args": ["--enable-automation"],
+        "viewport": {"width": 1366, "height": 768},
+        "locale": mcfg.get("locale", "en-US"),
+        "timezone_id": mcfg.get("timezone_id", "America/New_York"),
+        "user_agent": ua,
+        "extra_http_headers": {
+            "Accept-Language": mcfg.get("accept_language", "en-US,en;q=0.9"),
+        },
+    }
+    if proxy:
+        launch_kwargs["proxy"] = proxy
+        print(f"[PROXY] Browser routed via {proxy.get('server')}")
+    else:
+        print("[WARN] No proxy attached to browser.")
+
+    channel = "chrome" if config.USE_SYSTEM_CHROME else None
+    try:
+        if channel:
+            context = await p.chromium.launch_persistent_context(channel=channel, **launch_kwargs)
+        else:
+            context = await p.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as e:
+        print(f"[BROWSER] Launch failed: {e}")
+        raise
+
+    page = context.pages[0] if context.pages else await context.new_page()
+    await apply_stealth(page)
+    mode = "headless background" if config.HEADLESS else "visible"
+    print(f"[BROWSER] Started Chrome ({mode}) — no window interaction needed.")
+    return context, page, None, False
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+ALL_MARKETPLACES = tuple(config.MARKETPLACES.keys())
+
+
+def resolve_marketplace_arg() -> str:
+    if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
+        return sys.argv[1].strip().lower()
+    for i, arg in enumerate(sys.argv):
+        if arg in ("--marketplace", "--geo", "-m") and i + 1 < len(sys.argv):
+            return sys.argv[i + 1].strip().lower()
+    return str(config.MARKETPLACE).strip().lower()
+
+
+def resolve_marketplaces() -> list[str]:
+    arg = resolve_marketplace_arg()
+    if arg in {"all", "*"}:
+        # Every marketplace defined in config.MARKETPLACES
+        return list(config.MARKETPLACES.keys())
+    if arg not in config.MARKETPLACES:
+        raise ValueError(
+            f"Unknown marketplace '{arg}'. Use: {', '.join(config.MARKETPLACES)}, or all"
+        )
+    return [arg]
+
+
+def make_shared_run_folder() -> Path:
+    root = Path(getattr(config, "OUTPUT_DIR", "output"))
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if getattr(config, "OUTPUT_FOLDER_BY_DATETIME", True):
+        folder = root / stamp
+    else:
+        folder = root
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+async def scrape_one_marketplace(
+    page: Page,
+    marketplace: str,
+    run_folder: Path | None = None,
+) -> Path:
+    """Scrape one geo into its Excel. Returns output path."""
+    mcfg = marketplace_cfg(marketplace)
+    ensure_proxy_or_exit(marketplace, mcfg)
+
+    try:
+        asins = load_asins(mcfg["asin_file"])
+    except Exception as e:
+        print(f"[FATAL] Could not load ASINs for {marketplace}: {e}")
+        raise
+
+    if config.MAX_ASINS is not None:
+        asins = asins[: config.MAX_ASINS]
+
+    print(f"\n{'=' * 62}")
+    print(f"[INPUT] Marketplace: {marketplace.upper()} ({mcfg['name']})")
+    print(f"[INPUT] Domain: https://{mcfg['domain']}/")
+    print(f"[INPUT] {len(asins)} ASINs from {mcfg['asin_file']}")
+    print(
+        f"[SAFE] delay {config.DELAY_BETWEEN_ASINS_MIN}-{config.DELAY_BETWEEN_ASINS_MAX}s | "
+        f"stop after {getattr(config, 'MAX_CONSECUTIVE_BLOCKS', 3)} blocks"
+    )
+
+    if getattr(config, "NEW_FILE_EACH_RUN", True):
+        out_path = make_run_output_path(marketplace, run_folder=run_folder)
+        results: list[dict[str, Any]] = []
+        done: set[str] = set()
+        print(f"[OUTPUT] → {out_path}")
+    else:
+        out_path = Path(mcfg["output_file"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        results = load_results(out_path)
+        done = successful_asins(results) if config.RESUME_FROM_CHECKPOINT else set()
+        if getattr(config, "FORCE_RESCRAPE_ALL", False):
+            done = set()
+            results = []
+        elif done:
+            print(f"[RESUME] Skipping {len(done)} already Success/Skip ASINs.")
+
+    consecutive_blocks = 0
+    max_blocks = int(getattr(config, "MAX_CONSECUTIVE_BLOCKS", 3) or 3)
+
+    if not await manual_warmup(page, mcfg["domain"], marketplace):
+        print(f"[STOP] Warmup failed for {marketplace.upper()} — skipping this geo.")
+        save_results(results, out_path)
+        return out_path
+
+    await set_delivery_postal(page, marketplace, mcfg["domain"])
+
+    for i, asin in enumerate(asins, start=1):
+        if asin in done:
+            print(f"[SKIP] Already done: {asin}")
+            continue
+
+        print(f"\n----- [{marketplace.upper()}] ASIN {i}/{len(asins)}: {asin} -----")
+        rows: list[dict[str, Any]] = [
+            empty_row(asin, marketplace, product_url(mcfg["domain"], asin))
+        ]
+        for attempt in range(1, config.MAX_RETRIES_PER_ASIN + 1):
+            rows = await scrape_amazon_asin(page, asin, marketplace, mcfg)
+            status = str((rows[0] if rows else {}).get("status", ""))
+            if status == "Success":
+                consecutive_blocks = 0
+                break
+            if status in {"Skip", "NotFound"}:
+                break
+            if attempt < config.MAX_RETRIES_PER_ASIN:
+                print(
+                    f"[RETRY] {asin} attempt {attempt + 1}/{config.MAX_RETRIES_PER_ASIN}"
+                )
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                if status == "Blocked":
+                    await asyncio.sleep(config.BLOCK_COOLDOWN_SECONDS)
+
+        results = upsert_asin_rows(results, asin, rows)
+        save_results(results, out_path)
+        status = str((rows[0] if rows else {}).get("status", ""))
+        if status == "Success":
+            done.add(asin)
+            consecutive_blocks = 0
+        elif status in {"Skip", "NotFound"}:
+            done.add(asin)
+            consecutive_blocks = 0
+            print("[SKIP] Saved in Excel as status=Skip → next ASIN")
+        elif status == "Blocked":
+            consecutive_blocks += 1
+            print(f"[SAFE] Consecutive blocks: {consecutive_blocks}/{max_blocks}")
+            if consecutive_blocks >= max_blocks:
+                print(
+                    f"\n[STOP] Too many blocks on {marketplace.upper()}. "
+                    "Moving on / stopping this geo to protect IP."
+                )
+                break
+
+        if status in {"Skip", "NotFound"}:
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+        else:
+            await asyncio.sleep(
+                random.uniform(
+                    config.DELAY_BETWEEN_ASINS_MIN,
+                    config.DELAY_BETWEEN_ASINS_MAX,
+                )
+            )
+
+    print(f"\n[DONE] {marketplace.upper()} saved -> {out_path.resolve()}")
+    print(f"[DONE] {marketplace.upper()} rows: {len(results)}")
+    return out_path
+
+
+async def main() -> None:
+    try:
+        marketplaces = resolve_marketplaces()
+    except ValueError as e:
+        print(f"[FATAL] {e}")
+        sys.exit(1)
+
+    # Shared date-time folder when running one or all geos in this process
+    run_folder = (
+        make_shared_run_folder()
+        if getattr(config, "NEW_FILE_EACH_RUN", True)
+        else None
+    )
+    if run_folder:
+        print(f"[OUTPUT] Run folder → {run_folder.resolve()}")
+    if len(marketplaces) > 1:
+        print(f"[ALL] Will scrape in order: {', '.join(m.upper() for m in marketplaces)}")
+
+    first = marketplaces[0]
+    first_cfg = marketplace_cfg(first)
+    # Validate proxy rules up front for all targets
+    for m in marketplaces:
+        ensure_proxy_or_exit(m, marketplace_cfg(m))
+
+    saved: list[Path] = []
+
+    async with async_playwright() as p:
+        cdp_browser: Browser | None = None
+        using_cdp = False
+        proxy = resolve_proxy(first)
+
+        if config.CONNECT_EXISTING_CHROME:
+            cdp_browser, context, page, using_cdp = await connect_existing_chrome(
+                p, first_cfg["domain"]
+            )
+        else:
+            context, page, _, using_cdp = await create_context(
+                p, first_cfg, proxy=proxy
+            )
+
+        try:
+            for idx, marketplace in enumerate(marketplaces, start=1):
+                print(f"\n\n######## GEO {idx}/{len(marketplaces)}: {marketplace.upper()} ########")
+                if idx > 1:
+                    print(
+                        f"[ALL] Switching to {marketplace.upper()}. "
+                        "Pass captcha on that Amazon site if shown, then continue."
+                    )
+                try:
+                    out = await scrape_one_marketplace(page, marketplace, run_folder)
+                    saved.append(out)
+                except Exception as e:
+                    print(f"[ERROR] {marketplace.upper()} failed: {e}")
+                    continue
+                if idx < len(marketplaces):
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
+        finally:
+            if using_cdp and cdp_browser:
+                await cdp_browser.close()
+            elif not using_cdp:
+                await context.close()
+
+    print("\n" + "=" * 62)
+    print("[DONE] All requested marketplaces finished.")
+    for path in saved:
+        print(f"  → {path.resolve()}")
+    print("=" * 62)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

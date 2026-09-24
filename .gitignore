@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Browser profiles (Chrome locks these; don't commit)
+browser_profile/
+**/browser_profile/
+
+# Scraper outputs / local data
+output/
+**/output/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
