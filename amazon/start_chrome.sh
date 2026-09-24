@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Opens Chrome with debug port 9223 for the Amazon scraper.
-# Tip: Quit ALL Chrome windows first if this fails.
-# (Walmart scraper uses 9222 — Amazon uses 9223)
+# Opens Chrome with debug port 9223 for the Amazon scraper (Mac/Linux).
+# CRITICAL on Mac: quit ALL Chrome first, or you get
+#   "Opening in existing browser session" and debug port will NOT work.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILE="$SCRIPT_DIR/browser_profile"
+PORT=9223
 
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 if [[ ! -x "$CHROME" ]]; then
@@ -21,18 +22,44 @@ if [[ -z "${CHROME:-}" || ! -x "$CHROME" ]]; then
 fi
 
 echo
-echo "IMPORTANT: Quit all Chrome windows first, then press Enter..."
-read -r
+echo "Quitting ALL Google Chrome windows (required for debug port)..."
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  osascript -e 'tell application "Google Chrome" to quit' 2>/dev/null || true
+fi
+killall "Google Chrome" 2>/dev/null || true
+killall "Google Chrome Helper" 2>/dev/null || true
+killall chrome 2>/dev/null || true
+sleep 2
 
-echo "Starting Chrome on port 9223 for Amazon..."
-"$CHROME" \
-  --remote-debugging-port=9223 \
-  --user-data-dir="$PROFILE" \
-  "https://www.amazon.com/" &
+# Stale locks cause "Opening in existing browser session"
+mkdir -p "$PROFILE"
+rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonSocket" "$PROFILE/SingletonCookie" 2>/dev/null || true
+
+echo "Starting Chrome on port $PORT for Amazon..."
+echo "Profile: $PROFILE"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # open -na = new instance as a real Mac app (survives Terminal better)
+  open -na "Google Chrome" --args \
+    --remote-debugging-port="$PORT" \
+    --user-data-dir="$PROFILE" \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-session-crashed-bubble \
+    "https://www.amazon.com/"
+else
+  "$CHROME" \
+    --remote-debugging-port="$PORT" \
+    --user-data-dir="$PROFILE" \
+    --no-first-run \
+    --no-default-browser-check \
+    "https://www.amazon.com/" &
+fi
 
 echo
-echo "1) Complete captcha on Amazon if shown"
-echo "2) Wait for Amazon homepage"
-echo "3) Run:  python scraper.py us"
-echo "   Or:   python scraper.py uk / de / ca / ae"
+echo "Wait ~5 seconds, then check Amazon homepage."
+echo "1) Complete captcha if shown"
+echo "2) Keep this Chrome window open (do not quit Chrome)"
+echo "3) Mac screen lock is OK — do NOT Quit Chrome / Force Quit"
+echo "4) Run:  python3 scraper.py us"
 echo

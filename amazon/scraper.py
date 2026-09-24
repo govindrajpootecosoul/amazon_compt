@@ -2150,6 +2150,48 @@ def debug_port_open() -> bool:
         return False
 
 
+def _clear_chrome_profile_locks(profile: Path) -> None:
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _quit_chrome_processes() -> None:
+    """Mac/Windows: stop running Chrome so debug-port launch is not ignored."""
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        time.sleep(1)
+        for name in ("Google Chrome", "Google Chrome Helper"):
+            subprocess.run(
+                ["killall", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    elif sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        subprocess.run(
+            ["killall", "chrome", "google-chrome", "chromium"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    time.sleep(1.5)
+
+
 def launch_debug_chrome(domain: str) -> None:
     chrome = find_chrome_executable()
     if not chrome:
@@ -2159,14 +2201,42 @@ def launch_debug_chrome(domain: str) -> None:
 
     profile = Path(config.USER_DATA_DIR).resolve()
     profile.mkdir(parents=True, exist_ok=True)
+    _quit_chrome_processes()
+    _clear_chrome_profile_locks(profile)
+
+    url = f"https://{domain}/"
+    port = str(config.CHROME_DEBUG_PORT)
+    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {port})")
+
+    if sys.platform == "darwin":
+        # New Mac app instance — avoids "Opening in existing browser session"
+        subprocess.Popen(
+            [
+                "open",
+                "-na",
+                "Google Chrome",
+                "--args",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return
 
     cmd = [
         str(chrome),
-        f"--remote-debugging-port={config.CHROME_DEBUG_PORT}",
+        f"--remote-debugging-port={port}",
         f"--user-data-dir={profile}",
-        f"https://{domain}/",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
     ]
-    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {config.CHROME_DEBUG_PORT})")
     subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -2205,8 +2275,19 @@ async def connect_existing_chrome(
     last_error: Exception | None = None
     for attempt in range(1, 6):
         try:
-            browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            # no_defaults avoids Browser.setDownloadBehavior which newer Mac
+            # Chrome rejects ("Browser context management is not supported").
+            try:
+                browser = await p.chromium.connect_over_cdp(
+                    config.CHROME_DEBUG_URL, no_defaults=True
+                )
+            except TypeError:
+                browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
+            if not browser.contexts:
+                raise RuntimeError(
+                    "Chrome has no open window/context. Keep Chrome open after start_chrome."
+                )
+            context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
             print("[BROWSER] Connected to Chrome.")
             return browser, context, page, True
@@ -2216,7 +2297,13 @@ async def connect_existing_chrome(
                 await asyncio.sleep(1.5)
 
     print(f"[BROWSER] Could not connect: {last_error}")
-    print(f"[BROWSER] Fix: close Chrome, run {chrome_start_script()}, then retry.")
+    print(f"[BROWSER] Fix:")
+    print(f"  1) Quit ALL Chrome (Cmd+Q)")
+    print(f"  2) Run:  ./{Path(chrome_start_script()).name}   (from amazon/)")
+    print(f"  3) Wait for Amazon homepage — do not close Chrome")
+    print(f"  4) python3 scraper.py us")
+    if last_error and "setDownloadBehavior" in str(last_error):
+        print("[BROWSER] Also upgrade Playwright:  pip3 install -U 'playwright>=1.60'")
     raise SystemExit(1) from last_error
 
 
