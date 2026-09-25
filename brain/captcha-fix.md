@@ -7,7 +7,9 @@ The gray bar **"unsupported command-line flag: --no-sandbox"** means Playwright 
 ## Fix (3 steps)
 
 1. **Close** the Playwright Chrome window from `python scraper.py`.
-2. **Double-click** `start_chrome.bat`  
+2. Start normal Chrome with debug port:
+   - **Windows:** double-click `start_chrome.bat`
+   - **Mac:** `chmod +x start_chrome.sh && ./start_chrome.sh`
    - Opens normal Chrome (no automation flags) on port 9222.
 3. In **that** Chrome:
    - Go to https://www.walmart.com/
@@ -24,4 +26,4 @@ The scraper connects to your Chrome (`CONNECT_EXISTING_CHROME = True` in `config
 
 - Wait 30–60 minutes (IP may be temporarily flagged).
 - Set `PROXY_SERVER` in `config.py` to a US residential proxy.
-- Delete `browser_profile/` and start fresh with `start_chrome.bat`.
+- Delete `browser_profile/` and start fresh with `start_chrome.bat` / `start_chrome.sh`.

@@ -5,7 +5,7 @@ Excel columns (order):
 asin, marketplace, scraped_at, title, brand, price, was_price, currency,
 availability,
 offer_index, offer_count, is_buybox_winner,
-buybox_available, buybox_price, buybox_seller, buybox_ships_from,
+buybox_available, buybox_price, buybox_owner, buybox_ships_from,
 buybox_fulfilled_by, buybox_is_amazon, buybox_condition, buybox_delivery,
 rating, reviews_count, category,
 
@@ -37,8 +37,11 @@ url, http_status, status, error
 | offer_count | How many offers found for this ASIN |
 | is_buybox_winner | Yes for primary buy box |
 | buybox_available | `Yes` / `no buybox` |
+| buybox_owner | **Sold by** merchant name (not "Details" / "See less") |
+| price | Numeric buy-box price, or **`price not available`** when Amazon shows "Price higher than typical" |
 
 If product has no buy box → one row with `buybox_available = no buybox`.
+When price is suppressed, do not copy carousel / "options from AED …" into `price`.
 
 ## Output path
 

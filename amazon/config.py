@@ -36,6 +36,26 @@ PROXIES = {
 # Allow run without proxy (slow Chrome + manual captcha once)
 REQUIRE_PROXY = False
 
+# ---------------------------------------------------------------------------
+# Parallel workers (faster). Auto: ~10 ASINs per Chrome browser.
+# ---------------------------------------------------------------------------
+# Each browser scrapes this many ASINs. Browsers = ceil(total_asins / 10).
+ASINs_PER_WORKER = 10
+# Safety cap — never open more Chrome windows than this (no proxy: keep ≤5–8).
+MAX_WORKERS = 15
+# Fixed override: set e.g. 3 to force exactly 3 browsers; None = auto from ASINs_PER_WORKER.
+WORKERS = None
+# One proxy URL per worker (cycles if fewer than workers).
+# Leave empty to use PROXIES[marketplace] / PROXY_SERVER for every worker.
+# Format: "http://USERNAME:PASSWORD@host:port"
+PARALLEL_PROXIES: list[str | None] = [
+    # "http://USER:PASS@proxy1.example.com:8000",
+    # "http://USER:PASS@proxy2.example.com:8000",
+    # "http://USER:PASS@proxy3.example.com:8000",
+]
+# Debug ports when using CDP: worker0 → 9223, worker1 → 9224, …
+CHROME_DEBUG_PORT_BASE = 9223
+
 # --- Browser: real Chrome window (best chance without proxy) ---
 CONNECT_EXISTING_CHROME = True
 AUTO_LAUNCH_CHROME = True
@@ -48,8 +68,11 @@ HIDE_BROWSER_WINDOW = False
 USER_DATA_DIR = "browser_profile"
 SLOW_MO_MS = 0
 
-# One-time: pass Amazon captcha in Chrome, then press ENTER in terminal
+# One-time: open Amazon in Chrome. Captcha only if Amazon shows it.
 MANUAL_WARMUP = True
+# False = no Enter needed — auto-start when homepage is clear (recommended).
+# True  = old flow — wait until you press Enter in the terminal.
+WARMUP_REQUIRE_ENTER = False
 # If captcha appears mid-run, wait so you can solve it in the open Chrome window
 CAPTCHA_WAIT_SECONDS = 120
 MAX_RETRIES_PER_ASIN = 1

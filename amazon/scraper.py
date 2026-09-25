@@ -29,6 +29,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,7 +60,7 @@ COLUMNS = [
     "is_buybox_winner",
     "buybox_available",
     "buybox_price",
-    "buybox_seller",
+    "buybox_owner",
     "buybox_ships_from",
     "buybox_fulfilled_by",
     "buybox_is_amazon",
@@ -220,14 +221,15 @@ def product_url(domain: str, asin: str) -> str:
     return f"https://{domain}/dp/{asin}"
 
 
-def resolve_proxy(marketplace: str) -> dict[str, str] | None:
+def resolve_proxy(marketplace: str, raw_override: str | None = None) -> dict[str, str] | None:
     """Return Playwright proxy dict, or None if unset."""
-    raw = None
-    proxies = getattr(config, "PROXIES", None) or {}
-    if isinstance(proxies, dict):
-        raw = proxies.get(marketplace) or proxies.get(marketplace.lower())
+    raw = raw_override
     if not raw:
-        raw = getattr(config, "PROXY_SERVER", None)
+        proxies = getattr(config, "PROXIES", None) or {}
+        if isinstance(proxies, dict):
+            raw = proxies.get(marketplace) or proxies.get(marketplace.lower())
+        if not raw:
+            raw = getattr(config, "PROXY_SERVER", None)
     if not raw:
         return None
     raw = str(raw).strip()
@@ -248,6 +250,65 @@ def resolve_proxy(marketplace: str) -> dict[str, str] | None:
         out["username"] = m.group("user")
         out["password"] = m.group("pw") or ""
     return out
+
+
+def resolve_worker_proxy(marketplace: str, worker_id: int) -> dict[str, str] | None:
+    """Proxy for a parallel worker: PARALLEL_PROXIES[i] or marketplace proxy."""
+    plist = getattr(config, "PARALLEL_PROXIES", None) or []
+    plist = [p for p in plist if p]  # drop blanks / comments placeholders
+    if plist:
+        raw = plist[worker_id % len(plist)]
+        return resolve_proxy(marketplace, raw_override=str(raw))
+    return resolve_proxy(marketplace)
+
+
+def worker_count(asin_count: int | None = None) -> int:
+    """
+    How many Chrome workers to open.
+    - If WORKERS is a positive int → use that (fixed).
+    - Else if ASINs_PER_WORKER set → ceil(asins / 10) capped by MAX_WORKERS.
+    """
+    import math
+
+    max_w = int(getattr(config, "MAX_WORKERS", 15) or 15)
+    max_w = max(1, max_w)
+
+    fixed = getattr(config, "WORKERS", None)
+    if fixed is not None and str(fixed).strip() != "":
+        try:
+            n = int(fixed)
+            if n >= 1:
+                return min(n, max_w)
+        except (TypeError, ValueError):
+            pass
+
+    per = getattr(config, "ASINs_PER_WORKER", None)
+    if per and asin_count is not None:
+        try:
+            per_i = max(1, int(per))
+        except (TypeError, ValueError):
+            per_i = 10
+        n = max(1, int(math.ceil(asin_count / float(per_i))))
+        return min(n, max_w)
+
+    if per:
+        # asin count unknown yet — at least 1; parallel path will recompute
+        return min(2, max_w)
+
+    return 1
+
+
+def split_asins_round_robin(asins: list[str], n: int) -> list[list[str]]:
+    chunks: list[list[str]] = [[] for _ in range(n)]
+    for i, asin in enumerate(asins):
+        chunks[i % n].append(asin)
+    return chunks
+
+
+def split_asins_fixed_size(asins: list[str], per: int) -> list[list[str]]:
+    """Each chunk has up to `per` ASINs (last chunk may be smaller)."""
+    per = max(1, int(per))
+    return [asins[i : i + per] for i in range(0, len(asins), per)]
 
 
 def ensure_proxy_or_exit(marketplace: str, mcfg: dict[str, Any]) -> dict[str, str] | None:
@@ -428,10 +489,70 @@ def successful_asins(results: list[dict[str, Any]]) -> set[str]:
     return keys
 
 
+def _norm_price_key(price: Any) -> str:
+    """Normalize prices for matching ('40.80' == '40.8' == 'AED 40.80')."""
+    if price is None:
+        return ""
+    s = re.sub(r"[^0-9.]", "", str(price))
+    if not s or s == ".":
+        return ""
+    try:
+        return f"{float(s):.2f}"
+    except Exception:
+        return s
+
+
+def _dedupe_seller_phrase(t: str) -> str:
+    """
+    Fix garbled owners like:
+      'Day To Day … Day To Day … Sold by Day To Day …'
+      'TGMarket AE TGMarket AE Sold by TGMarket AE'
+    """
+    t = re.sub(r"\s+", " ", (t or "")).strip()
+    if not t:
+        return t
+    # Strip every leading "Sold by"
+    for _ in range(3):
+        nt = re.sub(
+            r"^(sold by|ships from|fulfilled by|delivered by)\s*[:\-]?\s*",
+            "",
+            t,
+            flags=re.I,
+        ).strip()
+        if nt == t:
+            break
+        t = nt
+    # Collapse exact repeated halves: "Name Name" / "Name Name Name"
+    for _ in range(4):
+        m = re.match(r"^(.+?)\s+\1(?:\s+\1)*$", t, flags=re.I)
+        if not m:
+            break
+        t = m.group(1).strip()
+    # "Name Sold by Name" or "Name Name Sold by Name"
+    m = re.match(r"^(.+?)(?:\s+\1)?\s+sold by\s+\1$", t, flags=re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^(.+?)\s+sold by\s+(.+)$", t, flags=re.I)
+    if m:
+        left, right = m.group(1).strip(), m.group(2).strip()
+        if left.lower() == right.lower():
+            return left
+        if right.lower() in left.lower():
+            return right
+        if left.lower() in right.lower():
+            return left
+        # Prefer the shorter clean merchant token after Sold by
+        return right if len(right) <= len(left) else left
+    # Trailing "Sold by …" junk
+    t = re.sub(r"\s+sold by\s+.*$", "", t, flags=re.I).strip()
+    return t
+
+
 def _clean_seller_name(text: str | None) -> str | None:
     if not text:
         return None
     t = re.sub(r"\s+", " ", str(text)).strip()
+    t = _dedupe_seller_phrase(t)
     t = re.sub(
         r"^(sold by|ships from|fulfilled by|delivered by|dispatched from|"
         r"shipper\s*/\s*seller|brand:|seller:|merchant:|بيع من|يشحن من|تم التوصيل بواسطة)\s*[:\-]?\s*",
@@ -439,14 +560,34 @@ def _clean_seller_name(text: str | None) -> str | None:
         t,
         flags=re.I,
     ).strip()
-    # Collapse noisy Amazon fulfillment phrases
+    t = _dedupe_seller_phrase(t)
+    # Collapse noisy Amazon fulfillment phrases → canonical owner name
+    if re.search(r"\bamazon\.ae\b", t, re.I):
+        if re.match(
+            r"^(amazon\.ae|amazon\s*ae)\b",
+            t,
+            re.I,
+        ) or re.search(
+            r"^(ships from|delivered by|fulfilled by|sold by)?\s*amazon\.ae\b",
+            t,
+            re.I,
+        ):
+            return "Amazon.ae"
     if re.search(r"amazon.*fulfilled by amazon", t, re.I):
         if re.search(r"amazon\.ae", t, re.I):
             return "Amazon.ae"
         return "Amazon"
+    if re.fullmatch(r"amazon(\.com)?", t, re.I):
+        return "Amazon"
+    if re.fullmatch(r"amazon\.ae", t, re.I):
+        return "Amazon.ae"
+    # Strip AOD UI chrome
+    t = re.sub(r"\s*see\s+(less|more|all)(\s+buying\s+options)?\b.*$", "", t, flags=re.I).strip()
+    t = re.sub(r"\s*\.+\s*more\s*$", "", t, flags=re.I).strip()
+    t = re.sub(r"\s+details\s*$", "", t, flags=re.I).strip()
     t = re.sub(r"\s*\d(?:\.\d)?\s*out of\s*5.*$", "", t, flags=re.I).strip()
     t = re.sub(r"\s*\(?\d[\d,]*\s*ratings?\)?\s*$", "", t, flags=re.I).strip()
-    # Reject UI column headers / labels (amazon.ae AOD shows "Shipper / Seller")
+    t = re.sub(r"\s*[\d]+%\s*positive.*$", "", t, flags=re.I).strip()
     junk = {
         "delivered by",
         "sold by",
@@ -461,13 +602,33 @@ def _clean_seller_name(text: str | None) -> str | None:
         "price",
         "condition",
         "delivery",
+        "details",
+        "see less",
+        "see more",
+        "see all",
+        "see all buying options",
+        "report",
+        "feedback",
+        "new",
+        "used",
+        "shop qualifying items",
+        "qualifying items",
+        "add to cart",
+        "more",
+        "... more",
+        "… more",
+        "learn more",
     }
     if t.lower() in junk:
+        return None
+    if re.fullmatch(r"\.{0,3}\s*more", t, flags=re.I):
+        return None
+    if re.fullmatch(r"shop\s+qualifying\s+items.*", t, flags=re.I):
         return None
     if re.fullmatch(r"shipper\s*/\s*seller.*", t, flags=re.I):
         return None
     if re.fullmatch(
-        r"(sold by|ships from|fulfilled by|delivered by|amazon\.ae\s*delivery)?",
+        r"(sold by|ships from|fulfilled by|delivered by|amazon\.ae\s*delivery|details|see\s+less|see\s+more)?",
         t,
         flags=re.I,
     ):
@@ -475,8 +636,13 @@ def _clean_seller_name(text: str | None) -> str | None:
     if len(t) < 2:
         return None
     t = re.sub(r"\s*\|\s*.*$", "", t).strip()
+    t = _dedupe_seller_phrase(t)
     if t.lower() in junk:
         return None
+    if re.fullmatch(r"amazon\.ae", t, re.I):
+        return "Amazon.ae"
+    if re.fullmatch(r"amazon(\.com)?", t, re.I):
+        return "Amazon"
     return t or None
 
 
@@ -500,37 +666,75 @@ def _is_amazon_seller(name: str | None) -> bool:
         return True
     if "amazon.ae" in n or n == "amazon ae":
         return True
+    # "Ships from Amazon", "Amazon Fulfilled", etc.
+    if re.fullmatch(r"amazon(\s*\.\s*[a-z.]+)?", n):
+        return True
+    if re.match(r"^amazon(\.ae|\.com)?\b", n) and len(n) < 40:
+        return True
     return False
+
+
+def _amazon_owner_label(domain: str | None = None, sample: str | None = None) -> str:
+    blob = f"{domain or ''} {sample or ''}".lower()
+    if "amazon.ae" in blob or blob.strip().endswith(".ae") or ".ae" in (domain or ""):
+        return "Amazon.ae"
+    if "amazon.co.uk" in blob or "amazon.de" in blob or "amazon.ca" in blob:
+        if "co.uk" in blob:
+            return "Amazon.co.uk"
+        if "amazon.de" in blob:
+            return "Amazon.de"
+        if "amazon.ca" in blob:
+            return "Amazon.ca"
+    return "Amazon"
 
 
 def _finalize_offer(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    if raw.get("_price_suppressed"):
+        # Amazon hid the buy-box price ("Price higher than typical")
+        out["buybox_available"] = "no buybox"
+        out["buybox_price"] = None
+        out["buybox_owner"] = _clean_seller_name(raw.get("buybox_owner"))
+        out["buybox_ships_from"] = _clean_seller_name(raw.get("buybox_ships_from"))
+        out["buybox_fulfilled_by"] = _clean_seller_name(raw.get("buybox_fulfilled_by"))
+        out["buybox_condition"] = _as_text(raw.get("buybox_condition"))
+        out["buybox_delivery"] = _as_text(raw.get("buybox_delivery"))
+        out["buybox_is_amazon"] = None
+        if raw.get("is_buybox_winner"):
+            out["is_buybox_winner"] = raw["is_buybox_winner"]
+        return out
+
     avail = raw.get("buybox_available")
-    if avail in (None, "", "No") and not raw.get("buybox_price") and not raw.get("buybox_seller"):
+    if avail in (None, "", "No") and not raw.get("buybox_price") and not raw.get("buybox_owner"):
         out["buybox_available"] = "no buybox"
     else:
         out["buybox_available"] = avail or (
-            "Yes" if raw.get("buybox_price") or raw.get("buybox_seller") else "no buybox"
+            "Yes" if raw.get("buybox_price") or raw.get("buybox_owner") else "no buybox"
         )
 
     out["buybox_price"] = _clean_price(raw.get("buybox_price"))
-    out["buybox_seller"] = _clean_seller_name(raw.get("buybox_seller"))
+    out["buybox_owner"] = _clean_seller_name(raw.get("buybox_owner"))
     out["buybox_ships_from"] = _clean_seller_name(raw.get("buybox_ships_from"))
     out["buybox_fulfilled_by"] = _clean_seller_name(raw.get("buybox_fulfilled_by"))
     out["buybox_condition"] = _as_text(raw.get("buybox_condition"))
     out["buybox_delivery"] = _as_text(raw.get("buybox_delivery"))
 
-    # If fulfilled/ships says Amazon but seller empty → seller = Amazon(.ae)
+    domain = str(raw.get("_domain") or "")
+
+    # If fulfilled/ships says Amazon but owner empty → owner = Amazon(.ae)
     for field in ("buybox_ships_from", "buybox_fulfilled_by"):
         val = out.get(field)
-        if val and _is_amazon_seller(val) and not out.get("buybox_seller"):
-            out["buybox_seller"] = val if "amazon" in val.lower() else "Amazon"
+        if val and _is_amazon_seller(val) and not out.get("buybox_owner"):
+            out["buybox_owner"] = (
+                val if re.search(r"amazon\.", val, re.I) else _amazon_owner_label(domain, val)
+            )
             break
-    # If seller empty but merchant_info_raw had amazon
-    if not out.get("buybox_seller") and raw.get("_amazon_fallback"):
-        out["buybox_seller"] = str(raw.get("_amazon_fallback"))
+    if not out.get("buybox_owner") and raw.get("_amazon_fallback"):
+        out["buybox_owner"] = _clean_seller_name(str(raw.get("_amazon_fallback"))) or str(
+            raw.get("_amazon_fallback")
+        )
 
-    seller = out.get("buybox_seller")
+    seller = out.get("buybox_owner")
     ships = out.get("buybox_ships_from")
     fulfilled = out.get("buybox_fulfilled_by")
     if out["buybox_available"] == "no buybox":
@@ -542,12 +746,21 @@ def _finalize_offer(raw: dict[str, Any]) -> dict[str, Any]:
     else:
         out["buybox_is_amazon"] = None
 
+    # Critical: Amazon offer must never leave buybox_owner blank
+    if out.get("buybox_is_amazon") == "Yes" and not out.get("buybox_owner"):
+        out["buybox_owner"] = _amazon_owner_label(
+            domain, f"{ships or ''} {fulfilled or ''} {raw.get('_amazon_fallback') or ''}"
+        )
+
     if raw.get("is_buybox_winner"):
         out["is_buybox_winner"] = raw["is_buybox_winner"]
+    # Final pass — collapse any remaining "Name Name Sold by Name"
+    if out.get("buybox_owner"):
+        out["buybox_owner"] = _clean_seller_name(out["buybox_owner"])
     return out
 
 
-async def extract_buybox(page: Page) -> dict[str, Any]:
+async def extract_buybox(page: Page, domain: str | None = None) -> dict[str, Any]:
     """Extract primary buy box winner details (works on .com / .ae / etc.)."""
     try:
         raw = await page.evaluate(
@@ -555,7 +768,7 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                 const out = {
                     buybox_available: null,
                     buybox_price: null,
-                    buybox_seller: null,
+                    buybox_owner: null,
                     buybox_ships_from: null,
                     buybox_fulfilled_by: null,
                     buybox_condition: null,
@@ -563,12 +776,52 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                     _amazon_fallback: null,
                 };
                 const text = (el) => (el && el.textContent ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+                const dedupeSeller = (t) => {
+                    let s = (t || '').replace(/\\s+/g, ' ').trim();
+                    if (!s) return s;
+                    for (let i = 0; i < 3; i++) {
+                        const n = s.replace(/^(sold by|ships from|fulfilled by|delivered by)\\s*[:\\-]?\\s*/i, '').trim();
+                        if (n === s) break;
+                        s = n;
+                    }
+                    for (let i = 0; i < 4; i++) {
+                        const m = s.match(/^(.+?)\\s+\\1(?:\\s+\\1)*$/i);
+                        if (!m) break;
+                        s = m[1].trim();
+                    }
+                    let m = s.match(/^(.+?)(?:\\s+\\1)?\\s+sold by\\s+\\1$/i);
+                    if (m) return m[1].trim();
+                    m = s.match(/^(.+?)\\s+sold by\\s+(.+)$/i);
+                    if (m) {
+                        const left = m[1].trim(), right = m[2].trim();
+                        if (left.toLowerCase() === right.toLowerCase()) return left;
+                        if (right.toLowerCase().includes(left.toLowerCase())) return left;
+                        if (left.toLowerCase().includes(right.toLowerCase())) return right;
+                        return right.length <= left.length ? right : left;
+                    }
+                    s = s.replace(/\\s+sold by\\s+.*$/i, '').trim();
+                    s = s.replace(/\\s+(?:ships from|delivered by|fulfilled by)\\s+.*$/i, '').trim();
+                    return s;
+                };
                 const cleanLabelValue = (t) => {
                     if (!t) return null;
-                    let s = t.replace(/\\s+/g, ' ').trim();
+                    let s = dedupeSeller(t);
                     s = s.replace(/^(sold by|ships from|fulfilled by|delivered by|dispatched from)\\s*[:\\-]?\\s*/i, '').trim();
-                    if (!s || /^(sold by|ships from|fulfilled by|delivered by)$/i.test(s)) return null;
+                    s = dedupeSeller(s);
+                    s = s.replace(/\\s*see\\s+(less|more|all)(\\s+buying\\s+options)?\\b.*$/i, '').trim();
+                    s = s.replace(/\\s+details\\s*$/i, '').trim();
+                    if (!s || /^(sold by|ships from|fulfilled by|delivered by|details|see\\s+less|see\\s+more|shop\\s+qualifying\\s+items)$/i.test(s)) return null;
+                    if (/^amazon\\.ae\\b/i.test(s)) return 'Amazon.ae';
+                    if (/^amazon\\b/i.test(s) && s.length < 20) return s.match(/^amazon(?:\\.[a-z.]+)?/i)[0];
                     return s;
+                };
+                const amazonLabel = () => {
+                    const host = (location.hostname || '').toLowerCase();
+                    if (host.includes('amazon.ae')) return 'Amazon.ae';
+                    if (host.includes('amazon.co.uk')) return 'Amazon.co.uk';
+                    if (host.includes('amazon.de')) return 'Amazon.de';
+                    if (host.includes('amazon.ca')) return 'Amazon.ca';
+                    return 'Amazon';
                 };
 
                 const addBtn =
@@ -579,18 +832,40 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                     document.querySelector('input[name="submit.add-to-cart"]');
                 out.buybox_available = addBtn ? 'Yes' : 'No';
 
-                const priceRoots = [
-                    '#price_inside_buybox',
-                    '#corePrice_feature_div .a-price:not(.a-text-price) span.a-offscreen',
-                    '#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) span.a-offscreen',
-                    '#apex_desktop .a-price:not(.a-text-price) span.a-offscreen',
-                    '#tp_price_block_total_price_ww span.a-offscreen',
-                    '#newBuyBoxPrice',
-                    '.a-price .a-offscreen',
-                ];
-                for (const sel of priceRoots) {
-                    const el = document.querySelector(sel);
-                    if (el && text(el)) { out.buybox_price = text(el); break; }
+                const buyboxZone = document.querySelector(
+                    '#desktop_buybox, #buybox, #rightCol, #apex_desktop, #corePrice_feature_div, #corePriceDisplay_desktop_feature_div'
+                );
+                const zoneTxt = ((buyboxZone && buyboxZone.innerText) || '').slice(0, 8000);
+                const priceSuppressed =
+                    /price\\s+higher\\s+than\\s+typical/i.test(zoneTxt) ||
+                    /we have recently seen better prices/i.test(zoneTxt);
+
+                if (priceSuppressed) {
+                    // Do not scrape carousel / "options from AED …" as the buy-box price
+                    out.buybox_price = null;
+                    out._price_suppressed = true;
+                    out.buybox_available = 'no buybox';
+                } else {
+                    const priceRoots = [
+                        '#price_inside_buybox',
+                        '#corePrice_feature_div .a-price:not(.a-text-price) span.a-offscreen',
+                        '#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) span.a-offscreen',
+                        '#apex_desktop .a-price:not(.a-text-price) span.a-offscreen',
+                        '#tp_price_block_total_price_ww span.a-offscreen',
+                        '#newBuyBoxPrice',
+                    ];
+                    for (const sel of priceRoots) {
+                        const el = document.querySelector(sel);
+                        if (el && text(el)) { out.buybox_price = text(el); break; }
+                    }
+                }
+
+                // Direct seller link FIRST (best signal — before tabular grabs concatenated junk)
+                const sellerLink = document.querySelector(
+                    '#sellerProfileTriggerId, a#sellerProfileTriggerId, #merchant-info a[href*="seller"], a[href*="/gp/help/seller"], a[href*="/sp?seller="], a[href*="/gp/aag/main"]'
+                );
+                if (sellerLink && text(sellerLink)) {
+                    out.buybox_owner = cleanLabelValue(text(sellerLink));
                 }
 
                 // Tabular buybox: label attribute OR sibling label text
@@ -599,12 +874,16 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                 ).forEach((tr) => {
                     const labelEl = tr.querySelector('[tabular-attribute-name], .tabular-buybox-label, .a-text-bold, td:first-child');
                     const valueEl = tr.querySelector(
-                        '.tabular-buybox-text, [tabular-attribute-name] + *, .offer-display-feature-text, td:last-child a, td:last-child span, a#sellerProfileTriggerId'
+                        '.tabular-buybox-text a, .tabular-buybox-text, [tabular-attribute-name] + *, .offer-display-feature-text a, .offer-display-feature-text, td:last-child a, td:last-child span, a#sellerProfileTriggerId'
                     );
                     const label = ((labelEl && (labelEl.getAttribute('tabular-attribute-name') || labelEl.innerText)) || '').toLowerCase();
-                    const val = cleanLabelValue(text(valueEl) || text(tr.querySelector('td:last-child')));
+                    let rawVal = text(valueEl) || text(tr.querySelector('td:last-child'));
+                    // Prefer anchor text only when present
+                    const anchor = tr.querySelector('a#sellerProfileTriggerId, a[href*="seller"], a[href*="/gp/aag/main"], a[href*="/sp?"]');
+                    if (anchor && text(anchor)) rawVal = text(anchor);
+                    const val = cleanLabelValue(rawVal);
                     if (!val) return;
-                    if (/sold|seller|merchant|بيع/.test(label) && !out.buybox_seller) out.buybox_seller = val;
+                    if (/sold|seller|merchant|بيع/.test(label) && !out.buybox_owner) out.buybox_owner = val;
                     if (/ship|dispatch|يشحن|delivery from/.test(label) && !out.buybox_ships_from) out.buybox_ships_from = val;
                     if (/fulfill|delivered by|تم التوصيل/.test(label) && !out.buybox_fulfilled_by) out.buybox_fulfilled_by = val;
                 });
@@ -613,23 +892,17 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                 document.querySelectorAll('[offer-display-feature-name], .offer-display-feature-text').forEach((el) => {
                     const name = (el.getAttribute('offer-display-feature-name') || '').toLowerCase();
                     const t = text(el);
-                    const val = cleanLabelValue(t);
-                    if (!val) return;
-                    if ((/merchant|sold|seller/.test(name) || /sold by/i.test(t)) && !out.buybox_seller) {
-                        out.buybox_seller = val;
+                    const soldM = t && t.match(/sold by\\s*[:\\-]?\\s*(.+?)(?:\\s+ships from|\\s+delivered by|\\s+fulfilled by|$)/i);
+                    const shipsM = t && t.match(/(?:ships from|delivered by|fulfilled by)\\s*[:\\-]?\\s*(.+?)(?:\\s+sold by|$)/i);
+                    const val = cleanLabelValue(soldM ? soldM[1] : t);
+                    if (!val && !shipsM) return;
+                    if ((/merchant|sold|seller/.test(name) || /sold by/i.test(t)) && !out.buybox_owner) {
+                        out.buybox_owner = val || cleanLabelValue(soldM && soldM[1]);
                     }
                     if ((/fulfiller|ships|dispatch/.test(name) || /ships from|delivered by/i.test(t)) && !out.buybox_ships_from) {
-                        out.buybox_ships_from = val;
+                        out.buybox_ships_from = cleanLabelValue(shipsM ? shipsM[1] : t);
                     }
                 });
-
-                // Direct seller link (best signal)
-                const sellerLink = document.querySelector(
-                    '#sellerProfileTriggerId, a#sellerProfileTriggerId, #merchant-info a, a[href*="/gp/help/seller"], a[href*="/sp?seller="], a[href*="/gp/aag/main"]'
-                );
-                if (sellerLink && text(sellerLink) && !out.buybox_seller) {
-                    out.buybox_seller = cleanLabelValue(text(sellerLink));
-                }
 
                 // merchant-info / fulfiller blocks — parse full sentence
                 const infoBlocks = [
@@ -639,23 +912,31 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                     '#availability_feature_div',
                     '#desktop_qualifiedBuyBox',
                     '#buybox',
+                    '#tabular-buybox',
                 ];
                 for (const sel of infoBlocks) {
-                    const t = text(document.querySelector(sel));
+                    const el = document.querySelector(sel);
+                    const t = text(el);
                     if (!t) continue;
-                    if (!out.buybox_seller) {
-                        let m = t.match(/sold by\\s+([^|.]+?)(?:\\s*\\||$|and\\s+fulfilled)/i)
+                    if (!out.buybox_owner) {
+                        const link = el && el.querySelector(
+                            'a#sellerProfileTriggerId, a[href*="/sp?seller="], a[href*="/gp/aag/main"], a[href*="/gp/help/seller"]'
+                        );
+                        if (link && text(link)) out.buybox_owner = cleanLabelValue(text(link));
+                    }
+                    if (!out.buybox_owner) {
+                        let m = t.match(/sold by\\s+([^|.]+?)(?:\\s*\\||$|and\\s+fulfilled|\\s+ships from)/i)
                             || t.match(/بيع من\\s+([^|.]+)/);
-                        if (m) out.buybox_seller = cleanLabelValue(m[1]);
+                        if (m) out.buybox_owner = cleanLabelValue(m[1]);
                     }
                     if (!out.buybox_ships_from) {
-                        let m = t.match(/ships from\\s+([^|.]+?)(?:\\s*\\||$)/i)
+                        let m = t.match(/ships from\\s+([^|.]+?)(?:\\s*\\||$|\\s+sold by)/i)
                             || t.match(/يشحن من\\s+([^|.]+)/);
                         if (m) out.buybox_ships_from = cleanLabelValue(m[1]);
                     }
                     if (/ships from and sold by amazon/i.test(t) || /sold by amazon\\.ae/i.test(t) || /amazon\\.ae/i.test(t) && /sold by/i.test(t)) {
                         out._amazon_fallback = /amazon\\.ae/i.test(t) ? 'Amazon.ae' : 'Amazon';
-                        out.buybox_seller = out.buybox_seller || out._amazon_fallback;
+                        out.buybox_owner = out.buybox_owner || out._amazon_fallback;
                         out.buybox_ships_from = out.buybox_ships_from || out._amazon_fallback;
                         out.buybox_fulfilled_by = out.buybox_fulfilled_by || out._amazon_fallback;
                     }
@@ -676,7 +957,7 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                         if (v) {
                             out.buybox_fulfilled_by = out.buybox_fulfilled_by || v;
                             out.buybox_ships_from = out.buybox_ships_from || v;
-                            if (/amazon/i.test(v) && !out.buybox_seller) out.buybox_seller = v;
+                            if (/amazon/i.test(v) && !out.buybox_owner) out.buybox_owner = v;
                         }
                     }
                 });
@@ -685,15 +966,31 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
                     out.buybox_fulfilled_by = out.buybox_ships_from;
                 }
 
-                // Last resort: if Add to Cart exists and page is amazon.ae with no seller, mark Amazon.ae
-                if (!out.buybox_seller && out.buybox_available === 'Yes') {
-                    const host = (location.hostname || '').toLowerCase();
-                    if (host.includes('amazon.ae')) {
-                        const pageText = (document.querySelector('#buybox, #desktop_buybox, #rightCol') || document.body).innerText || '';
-                        if (/amazon\\.ae/i.test(pageText) && /sold by|ships from|delivered by/i.test(pageText)) {
-                            out.buybox_seller = 'Amazon.ae';
-                            out._amazon_fallback = 'Amazon.ae';
-                        }
+                // Last resort: buy box present but Sold by missing / cleaned away
+                // Skip inventing Amazon owner when price is suppressed (no real buy box)
+                if (!out.buybox_owner && out.buybox_available === 'Yes' && !out._price_suppressed) {
+                    const label = amazonLabel();
+                    const pageText = (document.querySelector('#buybox, #desktop_buybox, #rightCol, #desktop_qualifiedBuyBox, #merchant-info') || document.body).innerText || '';
+                    const amazonSold =
+                        /sold by\\s+amazon/i.test(pageText) ||
+                        /ships from and sold by amazon/i.test(pageText) ||
+                        /sold by\\s+amazon\\.ae/i.test(pageText) ||
+                        (/amazon\\.ae/i.test(pageText) && /sold by|ships from|delivered by|fulfilled by/i.test(pageText));
+                    const shipsAmazon =
+                        /ships from\\s+amazon/i.test(pageText) ||
+                        /delivered by\\s+amazon/i.test(pageText) ||
+                        /fulfilled by\\s+amazon/i.test(pageText);
+                    if (amazonSold || (shipsAmazon && !/sold by\\s+(?!amazon)[A-Za-z]/i.test(pageText.slice(0, 2500)))) {
+                        out.buybox_owner = label;
+                        out._amazon_fallback = label;
+                        out.buybox_ships_from = out.buybox_ships_from || label;
+                        out.buybox_fulfilled_by = out.buybox_fulfilled_by || label;
+                    } else if (out.buybox_ships_from && /amazon/i.test(out.buybox_ships_from)) {
+                        out.buybox_owner = cleanLabelValue(out.buybox_ships_from) || label;
+                        out._amazon_fallback = label;
+                    } else if (out.buybox_fulfilled_by && /amazon/i.test(out.buybox_fulfilled_by)) {
+                        out.buybox_owner = cleanLabelValue(out.buybox_fulfilled_by) || label;
+                        out._amazon_fallback = label;
                     }
                 }
 
@@ -718,6 +1015,13 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
 
     if not isinstance(raw, dict):
         return {"buybox_available": "no buybox"}
+    if domain:
+        raw["_domain"] = domain
+    else:
+        try:
+            raw["_domain"] = (page.url or "").split("/")[2] if page.url else ""
+        except Exception:
+            raw["_domain"] = ""
     out = _finalize_offer(raw)
     out["is_buybox_winner"] = (
         "Yes" if out.get("buybox_available") not in {None, "no buybox", "No"} else "No"
@@ -725,7 +1029,7 @@ async def extract_buybox(page: Page) -> dict[str, Any]:
     return out
 
 
-async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
+async def extract_aod_offers(page: Page, domain: str | None = None) -> list[dict[str, Any]]:
     """
     Parse 'Other sellers on Amazon' AOD sidebar / offer-listing.
     Each offer card must get its own Sold by name (not only the first).
@@ -752,111 +1056,176 @@ async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
         raw_list = await page.evaluate(
             """() => {
                 const text = (el) => (el && el.textContent ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+                const isJunkName = (s) => {
+                    if (!s) return true;
+                    const x = String(s).replace(/\\s+/g, ' ').trim();
+                    // "More" / "... More" promo expand link — NOT a seller
+                    if (/^\\.{0,3}\\s*more\\s*$/i.test(x)) return true;
+                    return /^(sold by|ships from|fulfilled by|delivered by|shipper|seller|shipper\\s*\\/\\s*seller|price|condition|delivery|details|see\\s+less|see\\s+more|see\\s+all|see\\s+all\\s+buying\\s+options|report|feedback|new|used|shop\\s+qualifying\\s+items|qualifying\\s+items|add\\s+to\\s+cart|more|learn\\s+more)$/i.test(x)
+                        || /^shipper\\s*\\/\\s*seller/i.test(x)
+                        || /^see\\s+(less|more|all)/i.test(x)
+                        || /^shop\\s+qualifying/i.test(x)
+                        || /^\\.+\\s*more$/i.test(x);
+                };
                 const clean = (t) => {
                     if (!t) return null;
                     let s = String(t).replace(/\\s+/g, ' ').trim();
+                    // Collapse "Name Name Sold by Name"
+                    for (let i = 0; i < 3; i++) {
+                        const n = s.replace(/^(sold by|ships from|fulfilled by|delivered by|shipper\\s*\\/\\s*seller)\\s*[:\\-]?\\s*/i, '').trim();
+                        if (n === s) break;
+                        s = n;
+                    }
+                    for (let i = 0; i < 4; i++) {
+                        const m = s.match(/^(.+?)\\s+\\1(?:\\s+\\1)*$/i);
+                        if (!m) break;
+                        s = m[1].trim();
+                    }
+                    let dm = s.match(/^(.+?)(?:\\s+\\1)?\\s+sold by\\s+\\1$/i);
+                    if (dm) s = dm[1].trim();
+                    else {
+                        dm = s.match(/^(.+?)\\s+sold by\\s+(.+)$/i);
+                        if (dm) {
+                            const left = dm[1].trim(), right = dm[2].trim();
+                            if (left.toLowerCase() === right.toLowerCase()) s = left;
+                            else if (left.toLowerCase().includes(right.toLowerCase())) s = right;
+                            else if (right.toLowerCase().includes(left.toLowerCase())) s = left;
+                            else s = right.length <= left.length ? right : left;
+                        }
+                    }
                     s = s.replace(/^(sold by|ships from|fulfilled by|delivered by|shipper\\s*\\/\\s*seller)\\s*[:\\-]?\\s*/i, '').trim();
+                    s = s.replace(/\\s*see\\s+(less|more|all)(\\s+buying\\s+options)?\\b.*$/i, '').trim();
+                    s = s.replace(/\\s*\\.+\\s*more\\s*$/i, '').trim();
+                    s = s.replace(/\\s+details\\s*$/i, '').trim();
                     s = s.replace(/\\s*\\d(?:\\.\\d)?\\s*out of\\s*5.*$/i, '').trim();
                     s = s.replace(/\\s*\\(?\\d[\\d,]*\\s*ratings?\\)?\\s*$/i, '').trim();
+                    s = s.replace(/\\s*[\\d]+%\\s*positive.*$/i, '').trim();
                     s = s.replace(/\\s*Just Arrived\\s*$/i, '').trim();
-                    if (!s) return null;
-                    // Reject AOD column headers / labels (not real merchant names)
-                    if (/^(sold by|ships from|fulfilled by|delivered by|shipper|seller|shipper\\s*\\/\\s*seller|price|condition|delivery)$/i.test(s)) return null;
-                    if (/^shipper\\s*\\/\\s*seller/i.test(s)) return null;
-                    if (s.length < 2) return null;
+                    s = s.replace(/\\s+(?:AED|USD|GBP|EUR|CAD)\\s*[\\d.].*$/i, '').trim();
+                    s = s.replace(/\\s+(?:FREE\\s+)?delivery\\b.*$/i, '').trim();
+                    if (!s || isJunkName(s) || s.length < 2) return null;
+                    if (/^amazon\\.ae\\b/i.test(s)) return 'Amazon.ae';
                     return s;
                 };
-                const isLabelOnly = (s) => {
-                    if (!s) return true;
-                    return /^(sold by|ships from|fulfilled by|delivered by|shipper\\s*\\/\\s*seller|shipper|seller)$/i.test(s.trim());
+                const isLabelOnly = (s) => isJunkName(s);
+                const isSellerHref = (href) => {
+                    const h = (href || '').toLowerCase();
+                    return /\\/gp\\/aag\\/main|\\/sp\\?|seller=|\\/gp\\/help\\/seller|sellerprofile/i.test(h);
+                };
+                const pickSellerLinkNear = (node) => {
+                    if (!node) return null;
+                    const links = node.querySelectorAll('a');
+                    for (const link of links) {
+                        const raw = text(link);
+                        if (!raw || isJunkName(raw)) continue;
+                        const href = link.getAttribute('href') || '';
+                        if (isSellerHref(href) || /sold\\s*by/i.test((link.parentElement && link.parentElement.innerText) || '')) {
+                            const v = clean(raw);
+                            if (v && !isJunkName(v)) return v;
+                        }
+                    }
+                    // fallback: first non-junk link that is not promo/More
+                    for (const link of links) {
+                        const raw = text(link);
+                        if (!raw || isJunkName(raw)) continue;
+                        const href = (link.getAttribute('href') || '').toLowerCase();
+                        if (/more|detail|delivery|coupon|promo|learn|cart|wishlist|signin/i.test(href + ' ' + raw)) continue;
+                        const v = clean(raw);
+                        if (v && !isJunkName(v) && v.length >= 2) return v;
+                    }
+                    return null;
                 };
                 const parseSoldBy = (root) => {
-                    // 1) Seller hyperlinks inside this card
-                    const links = root.querySelectorAll(
-                        'a[href*="/gp/aag/main"], a[href*="/sp?seller="], a[href*="seller="], a[href*="/gp/help/seller"]'
-                    );
-                    for (const link of links) {
-                        const v = clean(text(link));
-                        if (v && !/^amazon\\s*fulfilled/i.test(v) && !isLabelOnly(v)) return v;
-                    }
-
-                    // 2) AE layout: label "Shipper / Seller" then value in next cell / sibling
-                    const all = root.querySelectorAll('span, div, td, th, a');
-                    for (const el of all) {
-                        const t = text(el);
-                        if (!t) continue;
-                        if (!/shipper\\s*\\/\\s*seller|sold by/i.test(t)) continue;
-                        if (isLabelOnly(t) || /^shipper\\s*\\/\\s*seller$/i.test(t.trim())) {
-                            // value may be next sibling or parent's next cell
-                            let sib = el.nextElementSibling;
-                            for (let i = 0; i < 4 && sib; i++, sib = sib.nextElementSibling) {
-                                const a = sib.querySelector && sib.querySelector('a');
-                                const v = clean(a ? text(a) : text(sib));
-                                if (v && !isLabelOnly(v)) return v;
-                            }
-                            const parent = el.parentElement;
-                            if (parent) {
-                                const kids = Array.from(parent.children);
-                                const idx = kids.indexOf(el);
-                                for (let j = idx + 1; j < kids.length && j < idx + 4; j++) {
-                                    const a = kids[j].querySelector && kids[j].querySelector('a');
-                                    const v = clean(a ? text(a) : text(kids[j]));
-                                    if (v && !isLabelOnly(v)) return v;
-                                }
-                                // same row: next td
-                                const td = el.closest && el.closest('td, th');
-                                if (td && td.nextElementSibling) {
-                                    const n = td.nextElementSibling;
-                                    const a = n.querySelector('a');
-                                    const v = clean(a ? text(a) : text(n));
-                                    if (v && !isLabelOnly(v)) return v;
-                                }
-                            }
-                            continue;
-                        }
-                        // "Sold by Name" in same node
-                        const m = t.match(/(?:sold by|shipper\\s*\\/\\s*seller)\\s*[:\\-]?\\s*(.+)$/i);
-                        if (m) {
-                            const v = clean(m[1]);
-                            if (v && !isLabelOnly(v)) return v;
-                        }
-                    }
-
-                    // 3) Classic soldBy containers
+                    // === PRIMARY: text immediately after "Sold by" (never position-based "More") ===
+                    // 1) Dedicated soldBy blocks
                     const blocks = root.querySelectorAll(
-                        '[id="aod-offer-soldBy"], [id*="soldBy"], [id*="sold-by"], .aod-offer-seller'
+                        '[id="aod-offer-soldBy"], [id*="soldBy"], [id*="sold-by"], [id*="SoldBy"], .aod-offer-seller, #aod-offer-soldBy'
                     );
                     for (const b of blocks) {
                         const a = b.querySelector('a');
-                        if (a && text(a)) {
+                        if (a) {
                             const v = clean(text(a));
-                            if (v && !isLabelOnly(v)) return v;
+                            if (v && !isJunkName(v)) return v;
                         }
                         const bt = text(b);
-                        if (isLabelOnly(bt) || /^shipper\\s*\\/\\s*seller/i.test(bt)) continue;
-                        const m = bt.match(/sold by\\s+(.+?)(?:\\s+\\d(?:\\.\\d)?\\s*out of|\\s+\\(?\\d|\\s*$)/i);
+                        const m = bt.match(/sold by\\s*[:\\-]?\\s*(.+)$/i);
                         if (m) {
                             const v = clean(m[1]);
-                            if (v && !isLabelOnly(v)) return v;
+                            if (v && !isJunkName(v)) return v;
                         }
                     }
+
+                    // 2) Find exact "Sold by" label nodes → owner is next to / after label
+                    const candidates = root.querySelectorAll('span, div, td, th, label, a');
+                    for (const el of candidates) {
+                        const t = text(el);
+                        if (!t) continue;
+                        // Exact / short label only
+                        if (/^sold by\\s*$/i.test(t) || /^sold by\\s*[:\\-]?\\s*$/i.test(t)) {
+                            // Prefer seller link in parent row
+                            const row = el.closest('div, tr, li, span') || el.parentElement;
+                            const fromRow = pickSellerLinkNear(row);
+                            if (fromRow) return fromRow;
+                            let sib = el.nextElementSibling;
+                            for (let i = 0; i < 5 && sib; i++, sib = sib.nextElementSibling) {
+                                const v = pickSellerLinkNear(sib) || clean(text(sib));
+                                if (v && !isJunkName(v)) return v;
+                            }
+                            continue;
+                        }
+                        // Same node: "Sold by PEAK NEST FZ LLE"
+                        if (/^sold by\\s+/i.test(t) && t.length < 120) {
+                            const m = t.match(/^sold by\\s*[:\\-]?\\s*(.+)$/i);
+                            if (m) {
+                                let v = clean(m[1]);
+                                if (v) {
+                                    v = v.replace(/\\s+\\d(?:\\.\\d)?\\s*out of.*$/i, '').trim();
+                                    v = v.replace(/\\s+[\\d]+%\\s*positive.*$/i, '').trim();
+                                    v = clean(v);
+                                }
+                                if (v && !isJunkName(v)) return v;
+                            }
+                        }
+                    }
+
+                    // 3) Full-card regex — stop before ratings / Add to cart / Delivered noise
                     const full = text(root);
-                    const m2 = full.match(/sold by\\s+(.+?)(?:\\s+(?:fulfilled by|delivered by|ships from)|\\s+\\d(?:\\.\\d)?\\s*out of|\\s+Add to Cart|$)/i);
+                    const m2 = full.match(
+                        /sold by\\s+(.+?)(?:\\s+\\d(?:\\.\\d)?\\s*out of|\\s+\\(?\\d[\\d,]*\\s*%|\\s+positive|\\s+Add to [Cc]art|\\s+Delivered by|\\s+Fulfilled by|\\s+Ships from|$)/i
+                    );
                     if (m2) {
                         const v = clean(m2[1]);
-                        if (v && !isLabelOnly(v)) return v;
+                        if (v && !isJunkName(v)) return v;
                     }
-                    // "Shipper / Seller Amazon.ae" or "Shipper / Seller Day To Day..."
-                    const m3 = full.match(/shipper\\s*\\/\\s*seller\\s+(.+?)(?:\\s+(?:fulfilled by|delivered by|ships from|add to cart)|$)/i);
+                    // Arabic AE
+                    const mAr = full.match(/بيع من\\s+(.+?)(?:\\s+\\d|$)/);
+                    if (mAr) {
+                        const v = clean(mAr[1]);
+                        if (v && !isJunkName(v)) return v;
+                    }
+                    // Shipper / Seller value (AE table)
+                    const m3 = full.match(/shipper\\s*\\/\\s*seller\\s+(.+?)(?:\\s+(?:fulfilled by|delivered by|ships from|add to cart|details|more)|\\s+\\d(?:\\.\\d)?\\s*out of|$)/i);
                     if (m3) {
                         const v = clean(m3[1]);
-                        if (v && !isLabelOnly(v)) return v;
+                        if (v && !isJunkName(v)) return v;
+                    }
+
+                    // 4) Last: seller-profile links only (never promo "More")
+                    const sellerLinks = root.querySelectorAll(
+                        'a[href*="/gp/aag/main"], a[href*="/sp?seller="], a[href*="seller="], a[href*="/gp/help/seller"], a#sellerProfileTriggerId'
+                    );
+                    for (const link of sellerLinks) {
+                        const raw = text(link);
+                        if (!raw || isJunkName(raw)) continue;
+                        // Skip links that are not near Sold by if card has Sold by elsewhere
+                        const v = clean(raw);
+                        if (v && !isJunkName(v)) return v;
                     }
                     return null;
                 };
                 const parseShips = (root) => {
                     const full = text(root);
-                    const m = full.match(/(?:ships from|delivered by|fulfilled by)\\s+(.+?)(?:\\s+sold by|\\s+Add to Cart|$)/i);
+                    const m = full.match(/(?:ships from|delivered by|fulfilled by)\\s+(.+?)(?:\\s+sold by|\\s+Add to Cart|\\s+Details|$)/i);
                     if (m) return clean(m[1]);
                     const el = root.querySelector('[id="aod-offer-shipsFrom"], [id*="shipsFrom"]');
                     if (el) return clean(text(el));
@@ -877,6 +1246,14 @@ async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
 
                 const offers = [];
                 const seen = new Set();
+                const amazonLabel = () => {
+                    const host = (location.hostname || '').toLowerCase();
+                    if (host.includes('amazon.ae')) return 'Amazon.ae';
+                    if (host.includes('amazon.co.uk')) return 'Amazon.co.uk';
+                    if (host.includes('amazon.de')) return 'Amazon.de';
+                    if (host.includes('amazon.ca')) return 'Amazon.ca';
+                    return 'Amazon';
+                };
                 const pushOffer = (root, pinned) => {
                     if (!root) return;
                     const full = text(root);
@@ -886,25 +1263,35 @@ async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
                     }
                     const price = parsePrice(root);
                     let seller = parseSoldBy(root);
-                    if (seller && isLabelOnly(seller)) seller = null;
+                    if (seller && isJunkName(seller)) seller = null;
                     const ships = parseShips(root);
+                    let fulfilled = null;
+                    if (/fulfilled by amazon|delivered by amazon/i.test(full)) {
+                        fulfilled = /amazon\\.ae/i.test(full) ? 'Amazon.ae' : amazonLabel();
+                    } else if (ships && !isJunkName(ships)) {
+                        fulfilled = ships;
+                    }
+                    // Amazon buy-box cards often have no Sold-by link — still keep owner
+                    if (!seller) {
+                        if (/sold by\\s+amazon/i.test(full) || /ships from and sold by amazon/i.test(full)) {
+                            seller = /amazon\\.ae/i.test(full) ? 'Amazon.ae' : amazonLabel();
+                        } else if (ships && /amazon/i.test(ships) && !/sold by\\s+(?!amazon)[\\w]/i.test(full)) {
+                            seller = /amazon\\.ae/i.test(ships) ? 'Amazon.ae' : (clean(ships) || amazonLabel());
+                        } else if (fulfilled && /amazon/i.test(fulfilled) && pinned) {
+                            seller = fulfilled;
+                        }
+                    }
+                    // Skip junk cards with no real merchant (e.g. only "Details")
+                    if (!seller) return;
                     if (!price && !seller) return;
-                    // Need a real merchant name or Amazon — never keep label text
-                    if (seller && /^shipper\\s*\\/\\s*seller/i.test(seller)) seller = null;
                     const key = (seller || '') + '|' + (price || '') + '|' + (ships || '');
                     if (seen.has(key)) return;
                     seen.add(key);
-                    let fulfilled = null;
-                    if (/fulfilled by amazon|delivered by amazon/i.test(full)) {
-                        fulfilled = /amazon\\.ae/i.test(full) ? 'Amazon.ae' : 'Amazon';
-                    } else if (ships && !isLabelOnly(ships)) {
-                        fulfilled = ships;
-                    }
                     offers.push({
                         buybox_available: 'Yes',
                         buybox_price: price,
-                        buybox_seller: seller,
-                        buybox_ships_from: (ships && !isLabelOnly(ships)) ? ships : null,
+                        buybox_owner: seller,
+                        buybox_ships_from: (ships && !isJunkName(ships)) ? ships : null,
                         buybox_fulfilled_by: fulfilled,
                         buybox_condition: 'New',
                         buybox_delivery: null,
@@ -924,7 +1311,7 @@ async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
                     pushOffer(el, false);
                 });
 
-                if (offers.filter(o => o.buybox_seller).length <= 1) {
+                if (offers.filter(o => o.buybox_owner).length <= 1) {
                     document.querySelectorAll('#aod-container div, #all-offers-display-scroller div, #aod-offer-list div').forEach((el) => {
                         const t = text(el);
                         if (!/sold by/i.test(t)) return;
@@ -942,8 +1329,15 @@ async def extract_aod_offers(page: Page) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if not isinstance(raw_list, list):
         return out
+    dom = domain or ""
+    if not dom:
+        try:
+            dom = (page.url or "").split("/")[2]
+        except Exception:
+            dom = ""
     for raw in raw_list:
         if isinstance(raw, dict):
+            raw["_domain"] = dom
             out.append(_finalize_offer(raw))
     return out
 
@@ -1006,33 +1400,64 @@ async def open_all_buying_options(page: Page, domain: str, asin: str) -> bool:
 
 async def collect_all_offers(page: Page, domain: str, asin: str) -> list[dict[str, Any]]:
     """Primary buy box + all other seller offers. Empty → caller fills 'no buybox'."""
+    # Let dynamic Sold by / merchant-info hydrate (parallel scrapes race this)
+    try:
+        await page.wait_for_selector(
+            "#sellerProfileTriggerId, #merchant-info, #tabular-buybox, "
+            "#merchantInfoFeature_feature_div, [offer-display-feature-name*='merchant'], "
+            "#add-to-cart-button, #buybox",
+            timeout=3500,
+        )
+    except Exception:
+        pass
+    try:
+        await asyncio.sleep(0.45)
+    except Exception:
+        pass
+
     offers: list[dict[str, Any]] = []
-    primary = await extract_buybox(page)
+    primary = await extract_buybox(page, domain)
     if primary.get("buybox_available") not in {"no buybox", "No", None} or primary.get(
         "buybox_price"
-    ) or primary.get("buybox_seller"):
+    ) or primary.get("buybox_owner"):
         if primary.get("buybox_available") == "No" and not primary.get("buybox_price"):
             pass
         else:
             if primary.get("buybox_available") == "No":
                 primary["buybox_available"] = "Yes"
             primary["is_buybox_winner"] = "Yes"
+            if primary.get("buybox_is_amazon") == "Yes" and not primary.get("buybox_owner"):
+                primary["buybox_owner"] = _amazon_owner_label(domain)
             offers.append(primary)
 
     opened = await open_all_buying_options(page, domain, asin)
+    pinned_owner: str | None = None
+    pinned_ships: str | None = None
+    pinned_price: str | None = None
     if opened:
-        more = await extract_aod_offers(page)
+        more = await extract_aod_offers(page, domain)
         seen: set[tuple[str, str]] = set()
         for o in offers:
             seen.add(
                 (
-                    str(o.get("buybox_seller") or "").lower(),
-                    str(o.get("buybox_price") or ""),
+                    str(o.get("buybox_owner") or "").lower(),
+                    _norm_price_key(o.get("buybox_price")),
                 )
             )
-        for o in more:
-            seller = str(o.get("buybox_seller") or "").lower()
-            price = str(o.get("buybox_price") or "")
+        for idx, o in enumerate(more):
+            o["buybox_owner"] = _clean_seller_name(o.get("buybox_owner"))
+            if o.get("buybox_is_amazon") == "Yes" and not o.get("buybox_owner"):
+                o["buybox_owner"] = _amazon_owner_label(domain)
+            # Skip empty junk offers
+            if not o.get("buybox_price") and not o.get("buybox_owner"):
+                continue
+            # First AOD card / pinned often mirrors the buy-box winner
+            if idx == 0 and o.get("buybox_owner"):
+                pinned_owner = o.get("buybox_owner")
+                pinned_ships = o.get("buybox_ships_from")
+                pinned_price = o.get("buybox_price")
+            seller = str(o.get("buybox_owner") or "").lower()
+            price = _norm_price_key(o.get("buybox_price"))
             key = (seller, price)
             if seller and key in seen:
                 continue
@@ -1045,7 +1470,54 @@ async def collect_all_offers(page: Page, domain: str, asin: str) -> list[dict[st
     if offers and not any(str(o.get("is_buybox_winner")) == "Yes" for o in offers):
         offers[0]["is_buybox_winner"] = "Yes"
 
-    named = sum(1 for o in offers if o.get("buybox_seller"))
+    # Repair blank winners: same-price AOD row → pinned AOD → ships-from Amazon
+    for o in offers:
+        o["buybox_owner"] = _clean_seller_name(o.get("buybox_owner"))
+        o["buybox_ships_from"] = _clean_seller_name(o.get("buybox_ships_from"))
+    for o in offers:
+        if str(o.get("is_buybox_winner")) != "Yes":
+            continue
+        if o.get("buybox_owner"):
+            continue
+        price = _norm_price_key(o.get("buybox_price"))
+        if price:
+            for other in offers:
+                if other is o:
+                    continue
+                if _norm_price_key(other.get("buybox_price")) == price and other.get("buybox_owner"):
+                    o["buybox_owner"] = other["buybox_owner"]
+                    o["buybox_ships_from"] = o.get("buybox_ships_from") or other.get(
+                        "buybox_ships_from"
+                    )
+                    o["buybox_fulfilled_by"] = o.get("buybox_fulfilled_by") or other.get(
+                        "buybox_fulfilled_by"
+                    )
+                    break
+        if not o.get("buybox_owner") and pinned_owner:
+            # Use pinned when price matches or winner price missing
+            if (not price) or (not pinned_price) or _norm_price_key(pinned_price) == price:
+                o["buybox_owner"] = pinned_owner
+                o["buybox_ships_from"] = o.get("buybox_ships_from") or pinned_ships
+        if not o.get("buybox_owner") and _is_amazon_seller(o.get("buybox_ships_from")):
+            o["buybox_owner"] = _amazon_owner_label(domain, o.get("buybox_ships_from"))
+        if not o.get("buybox_owner") and _is_amazon_seller(o.get("buybox_fulfilled_by")):
+            o["buybox_owner"] = _amazon_owner_label(domain, o.get("buybox_fulfilled_by"))
+
+    # Drop totally empty no-buybox noise rows (keep one if that's all we have)
+    cleaned: list[dict[str, Any]] = []
+    for o in offers:
+        if (
+            o.get("buybox_available") == "no buybox"
+            and not o.get("buybox_price")
+            and not o.get("buybox_owner")
+            and str(o.get("is_buybox_winner")) != "Yes"
+        ):
+            continue
+        cleaned.append(o)
+    if cleaned:
+        offers = cleaned
+
+    named = sum(1 for o in offers if o.get("buybox_owner"))
     print(f"[BUYBOX] offers={len(offers)} with_seller_name={named}")
     return offers
 
@@ -1166,19 +1638,29 @@ async def manual_warmup(page: Page, domain: str, marketplace: str) -> bool:
         return await auto_warmup(page, domain, marketplace)
 
     home = f"https://{domain}/"
+    require_enter = bool(getattr(config, "WARMUP_REQUIRE_ENTER", False))
+    wait_s = int(getattr(config, "CAPTCHA_WAIT_SECONDS", 120) or 120)
+
     print("\n" + "=" * 62)
     if config.CONNECT_EXISTING_CHROME:
         hint = chrome_start_script()
         print(f"WARMUP: Use Chrome opened by {hint} (NOT Playwright Chrome).")
         if sys.platform == "win32":
-            print(f"  1) Double-click {hint}")
+            print(f"  1) Double-click {hint} (if Chrome not already open)")
         else:
-            print(f"  1) In Terminal: chmod +x {hint} && ./{hint}")
-        print(f"  2) In that Chrome, open {home}")
-        print("  3) Complete captcha / continue shopping if shown")
-        print("  4) Come back here and press ENTER")
+            print(f"  1) Run ./{Path(hint).name} if Chrome not already open")
+        print(f"  2) In that Chrome, open {home} if needed")
+        print("  3) Complete captcha only if Amazon shows it")
+        if require_enter:
+            print("  4) Come back here and press ENTER")
+        else:
+            print("  4) No ENTER needed — script auto-starts when page is clear")
     else:
-        print(f"WARMUP: Complete Amazon ({marketplace.upper()}) captcha, then press ENTER.")
+        print(f"WARMUP: Complete Amazon ({marketplace.upper()}) captcha if shown.")
+        if require_enter:
+            print("Then press ENTER.")
+        else:
+            print("No ENTER needed — auto-continues when clear.")
     print("=" * 62)
 
     try:
@@ -1186,14 +1668,39 @@ async def manual_warmup(page: Page, domain: str, marketplace: str) -> bool:
     except Exception as e:
         print(f"[WARMUP] Could not open Amazon: {e}")
 
-    await asyncio.to_thread(
-        input,
-        f"\nPress ENTER when {marketplace.upper()} Amazon homepage is open (no captcha)... ",
-    )
+    async def _page_ready() -> bool:
+        html = await page.content()
+        title = await page.title()
+        return not is_challenge_html(html, title)
 
-    html = await page.content()
-    title = await page.title()
-    if is_challenge_html(html, title):
+    if await _page_ready():
+        print(f"[WARMUP] OK — Amazon {marketplace.upper()} already clear. Starting scrape...\n")
+        return True
+
+    if require_enter:
+        await asyncio.to_thread(
+            input,
+            f"\nPress ENTER when {marketplace.upper()} Amazon homepage is open (no captcha)... ",
+        )
+    else:
+        print(
+            f"[WARMUP] Captcha / challenge detected — solve it in Chrome. "
+            f"Waiting up to {wait_s}s (no Enter needed)..."
+        )
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            await asyncio.sleep(2.0)
+            if await _page_ready():
+                print(
+                    f"[WARMUP] OK — Amazon {marketplace.upper()} session looks good. "
+                    "Starting scrape...\n"
+                )
+                return True
+        print("[WARMUP] Still on captcha after wait.")
+        print(f"[WARMUP] Solve captcha in Chrome, then re-run — or set WARMUP_REQUIRE_ENTER = True.")
+        return False
+
+    if not await _page_ready():
         print("[WARMUP] Still on captcha / robot check. Captcha did NOT pass.")
         print(f"[WARMUP] Use {chrome_start_script()}, pass captcha, then run again.")
         return False
@@ -1318,9 +1825,13 @@ def _clean_price(text: str | None) -> str | None:
     if not text:
         return None
     t = re.sub(r"\s+", " ", str(text)).strip()
+    if re.search(r"price\s+not\s+available", t, re.I):
+        return "price not available"
+    if re.search(r"price\s+higher\s+than\s+typical", t, re.I):
+        return None
     # Keep currency symbol optional in output — strip for parsing
     m = re.search(
-        r"(?:USD|CAD|GBP|EUR|\$|£|€)\s*([\d.,]+)|([\d.,]+)\s*(?:USD|CAD|GBP|EUR)|([\d.,]+)",
+        r"(?:USD|CAD|GBP|EUR|AED|\$|£|€)\s*([\d.,]+)|([\d.,]+)\s*(?:USD|CAD|GBP|EUR|AED)|([\d.,]+)",
         t,
         re.I,
     )
@@ -1356,22 +1867,77 @@ def _clean_price(text: str | None) -> str | None:
     return raw
 
 
+PRICE_NOT_AVAILABLE = "price not available"
+
+
+async def _buybox_price_suppressed(page: Page) -> bool:
+    """
+    True when Amazon hides the buy-box price with
+    'Price higher than typical' / only 'See All Buying Options' (no Add to Cart).
+    """
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const body = (document.body && document.body.innerText) || '';
+                    const buybox = document.querySelector(
+                        '#desktop_buybox, #buybox, #rightCol, #ppd, #apex_desktop, #corePrice_feature_div, #corePriceDisplay_desktop_feature_div'
+                    );
+                    const zone = ((buybox && buybox.innerText) || body).slice(0, 8000);
+                    if (/price\\s+higher\\s+than\\s+typical/i.test(zone)) return true;
+                    if (/we have recently seen better prices/i.test(zone)) return true;
+                    const addBtn =
+                        document.querySelector('#add-to-cart-button') ||
+                        document.querySelector('#buy-now-button') ||
+                        document.querySelector('input#add-to-cart-button') ||
+                        document.querySelector('input[name="submit.add-to-cart"]');
+                    const seeAll =
+                        document.querySelector('#buybox-see-all-buying-options-announce') ||
+                        Array.from(document.querySelectorAll('a, span, input, button')).some(
+                            (el) => /see\\s+all\\s+buying\\s+options/i.test((el.innerText || el.value || '').trim())
+                        );
+                    // Suppressed buy box: no ATC, but See All Buying Options is the CTA
+                    if (!addBtn && seeAll && !document.querySelector('#price_inside_buybox .a-offscreen, #corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen')) {
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 async def _extract_main_price(page: Page) -> str | None:
-    """Read buy-box price via a-offscreen or whole+fraction (avoids 952 style concat bugs)."""
+    """Read buy-box price. Never invent price from carousels when buy box is suppressed."""
+    if await _buybox_price_suppressed(page):
+        return PRICE_NOT_AVAILABLE
     try:
         raw = await page.evaluate(
             """() => {
+                const zoneText = () => {
+                    const buybox = document.querySelector(
+                        '#desktop_buybox, #buybox, #rightCol, #apex_desktop, #corePrice_feature_div, #corePriceDisplay_desktop_feature_div'
+                    );
+                    return ((buybox && buybox.innerText) || '').slice(0, 5000);
+                };
+                if (/price\\s+higher\\s+than\\s+typical/i.test(zoneText())) {
+                    return '__PRICE_SUPPRESSED__';
+                }
                 const roots = [
+                    '#price_inside_buybox',
                     '#corePrice_feature_div',
                     '#corePriceDisplay_desktop_feature_div',
                     '#apex_desktop',
                     '#tp_price_block_total_price_ww',
                     '#price',
-                    '#price_inside_buybox',
                 ];
                 for (const sel of roots) {
                     const box = document.querySelector(sel);
                     if (!box) continue;
+                    // Skip if this box is the "higher than typical" message area
+                    const bt = (box.innerText || '');
+                    if (/price\\s+higher\\s+than\\s+typical/i.test(bt)) continue;
                     const off = box.querySelector('.a-price:not(.a-text-price) span.a-offscreen');
                     if (off && off.textContent && off.textContent.trim()) {
                         return off.textContent.trim();
@@ -1386,19 +1952,20 @@ async def _extract_main_price(page: Page) -> str | None:
                         if (w) return w + '.' + (f || '00');
                     }
                 }
-                // last resort: any primary offscreen price
-                const any = document.querySelector(
-                    'span.a-price.aok-align-center span.a-offscreen, #priceblock_ourprice, #priceblock_dealprice'
-                );
-                return any && any.textContent ? any.textContent.trim() : null;
+                // Do NOT fall back to random page prices (carousels / "options from AED …")
+                return null;
             }"""
         )
+        if raw == "__PRICE_SUPPRESSED__":
+            return PRICE_NOT_AVAILABLE
         return _clean_price(raw)
     except Exception:
         return None
 
 
 async def _extract_was_price(page: Page) -> str | None:
+    if await _buybox_price_suppressed(page):
+        return None
     try:
         raw = await page.evaluate(
             """() => {
@@ -1410,6 +1977,7 @@ async def _extract_was_price(page: Page) -> str | None:
                 for (const sel of roots) {
                     const box = document.querySelector(sel);
                     if (!box) continue;
+                    if (/price\\s+higher\\s+than\\s+typical/i.test(box.innerText || '')) continue;
                     const off = box.querySelector(
                         'span.a-price.a-text-price[data-a-strike="true"] span.a-offscreen, span.a-price.a-text-price span.a-offscreen'
                     );
@@ -1746,6 +2314,7 @@ async def extract_from_dom(page: Page) -> dict[str, Any]:
 
     data["price"] = await _extract_main_price(page)
     data["was_price"] = await _extract_was_price(page)
+    price_suppressed = data.get("price") == PRICE_NOT_AVAILABLE
 
     data["availability"] = await _text(
         page,
@@ -1839,13 +2408,25 @@ async def extract_from_dom(page: Page) -> dict[str, Any]:
     )
 
     # Primary buy box only here; full multi-offer list collected later
-    buybox = await extract_buybox(page)
+    try:
+        host = (page.url or "").split("/")[2]
+    except Exception:
+        host = None
+    buybox = await extract_buybox(page, host)
     data.update(buybox)
-    if buybox.get("buybox_seller") and not data.get("seller"):
-        data["seller"] = buybox["buybox_seller"]
+    if buybox.get("buybox_owner") and not data.get("seller"):
+        data["seller"] = buybox["buybox_owner"]
     if buybox.get("buybox_ships_from") and not data.get("ships_from"):
         data["ships_from"] = buybox["buybox_ships_from"]
-    if buybox.get("buybox_price") and not data.get("price"):
+    # Suppressed buy box: never fill price from stray buybox/carousel numbers
+    if price_suppressed or buybox.get("_price_suppressed"):
+        data["price"] = PRICE_NOT_AVAILABLE
+        data["was_price"] = None
+        data["buybox_price"] = None
+        data["_price_suppressed"] = True
+        if data.get("buybox_available") in {None, "Yes", "No"}:
+            data["buybox_available"] = "no buybox"
+    elif buybox.get("buybox_price") and not data.get("price"):
         data["price"] = buybox["buybox_price"]
 
     # Full Product information tables (Item details / Style / Materials / etc.)
@@ -1880,7 +2461,7 @@ def _rows_from_offers(
         row["is_buybox_winner"] = "No"
         row["buybox_available"] = "no buybox"
         row["buybox_price"] = None
-        row["buybox_seller"] = None
+        row["buybox_owner"] = None
         row["buybox_ships_from"] = None
         row["buybox_fulfilled_by"] = None
         row["buybox_is_amazon"] = None
@@ -1898,7 +2479,7 @@ def _rows_from_offers(
         for key in [
             "buybox_available",
             "buybox_price",
-            "buybox_seller",
+            "buybox_owner",
             "buybox_ships_from",
             "buybox_fulfilled_by",
             "buybox_is_amazon",
@@ -1907,11 +2488,15 @@ def _rows_from_offers(
         ]:
             if offer.get(key) is not None:
                 row[key] = offer.get(key)
-        if offer.get("buybox_seller"):
-            row["seller"] = offer["buybox_seller"]
+        if offer.get("buybox_owner"):
+            row["seller"] = offer["buybox_owner"]
         if offer.get("buybox_ships_from"):
             row["ships_from"] = offer["buybox_ships_from"]
-        if offer.get("buybox_price") and i == 1:
+        # Main price column: keep "price not available" when Amazon suppressed the buy-box price.
+        # Real offer amounts stay in buybox_price only.
+        if base.get("price") == PRICE_NOT_AVAILABLE or base.get("_price_suppressed"):
+            row["price"] = PRICE_NOT_AVAILABLE
+        elif offer.get("buybox_price") and i == 1:
             row["price"] = offer["buybox_price"]
         rows.append(row)
     return rows
@@ -2004,7 +2589,14 @@ async def scrape_amazon_asin(
         parsed = _parse_json_ld(html)
         # Product fields only (not multi-offer yet)
         dom = await extract_from_dom(page)
+        # DOM wins for price (esp. "price not available" when buy box suppressed)
         parsed.update({k: v for k, v in dom.items() if v})
+        if dom.get("price") == PRICE_NOT_AVAILABLE or dom.get("_price_suppressed"):
+            parsed["price"] = PRICE_NOT_AVAILABLE
+            parsed["was_price"] = None
+            parsed["buybox_price"] = None
+            parsed["_price_suppressed"] = True
+            parsed["buybox_available"] = "no buybox"
 
         for key in [
             "title",
@@ -2142,9 +2734,10 @@ def find_chrome_executable() -> Path | None:
     return None
 
 
-def debug_port_open() -> bool:
+def debug_port_open(port: int | None = None) -> bool:
+    p = int(port if port is not None else config.CHROME_DEBUG_PORT)
     try:
-        with socket.create_connection(("127.0.0.1", config.CHROME_DEBUG_PORT), timeout=1.5):
+        with socket.create_connection(("127.0.0.1", p), timeout=1.5):
             return True
     except OSError:
         return False
@@ -2192,35 +2785,63 @@ def _quit_chrome_processes() -> None:
     time.sleep(1.5)
 
 
-def launch_debug_chrome(domain: str) -> None:
+def _proxy_server_arg(proxy: dict[str, str] | None) -> str | None:
+    """Chrome --proxy-server value (host:port). Auth proxies need Playwright launch instead."""
+    if not proxy or not proxy.get("server"):
+        return None
+    server = proxy["server"]
+    # strip scheme for Chrome flag where needed; Chrome accepts http://host:port
+    if proxy.get("username"):
+        # Embed user:pass — works on many Chrome builds for HTTP proxies
+        m = re.match(r"^(https?|socks5)://(.+)$", server, re.I)
+        if m:
+            return f"{m.group(1)}://{proxy['username']}:{proxy.get('password') or ''}@{m.group(2)}"
+    return server
+
+
+def launch_debug_chrome(
+    domain: str,
+    *,
+    port: int | None = None,
+    profile_dir: str | Path | None = None,
+    proxy: dict[str, str] | None = None,
+    quit_existing: bool = True,
+) -> None:
     chrome = find_chrome_executable()
     if not chrome:
         raise FileNotFoundError(
             "Google Chrome not found. Install Chrome or set Chrome path manually."
         )
 
-    profile = Path(config.USER_DATA_DIR).resolve()
+    profile = Path(profile_dir or config.USER_DATA_DIR).resolve()
     profile.mkdir(parents=True, exist_ok=True)
-    _quit_chrome_processes()
+    if quit_existing:
+        _quit_chrome_processes()
     _clear_chrome_profile_locks(profile)
 
     url = f"https://{domain}/"
-    port = str(config.CHROME_DEBUG_PORT)
-    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {port})")
+    port_i = int(port if port is not None else config.CHROME_DEBUG_PORT)
+    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {port_i}) profile={profile.name}")
+
+    extra: list[str] = []
+    proxy_arg = _proxy_server_arg(proxy)
+    if proxy_arg:
+        extra.append(f"--proxy-server={proxy_arg}")
+        print(f"[PROXY] Chrome --proxy-server={proxy.get('server')}")
 
     if sys.platform == "darwin":
-        # New Mac app instance — avoids "Opening in existing browser session"
         subprocess.Popen(
             [
                 "open",
                 "-na",
                 "Google Chrome",
                 "--args",
-                f"--remote-debugging-port={port}",
+                f"--remote-debugging-port={port_i}",
                 f"--user-data-dir={profile}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-session-crashed-bubble",
+                *extra,
                 url,
             ],
             stdout=subprocess.DEVNULL,
@@ -2231,10 +2852,11 @@ def launch_debug_chrome(domain: str) -> None:
 
     cmd = [
         str(chrome),
-        f"--remote-debugging-port={port}",
+        f"--remote-debugging-port={port_i}",
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
+        *extra,
         url,
     ]
     subprocess.Popen(
@@ -2245,44 +2867,54 @@ def launch_debug_chrome(domain: str) -> None:
     )
 
 
-async def wait_for_debug_port(seconds: int = 45) -> bool:
+async def wait_for_debug_port(seconds: int = 45, port: int | None = None) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
-        if debug_port_open():
+        if debug_port_open(port):
             return True
         await asyncio.sleep(0.75)
     return False
 
 
 async def connect_existing_chrome(
-    p, domain: str
+    p,
+    domain: str,
+    *,
+    port: int | None = None,
+    profile_dir: str | Path | None = None,
+    proxy: dict[str, str] | None = None,
+    quit_existing: bool = True,
 ) -> tuple[Browser, BrowserContext, Page, bool]:
-    print(f"[BROWSER] Connecting to {config.CHROME_DEBUG_URL} ...")
+    port_i = int(port if port is not None else config.CHROME_DEBUG_PORT)
+    cdp_url = f"http://127.0.0.1:{port_i}"
+    print(f"[BROWSER] Connecting to {cdp_url} ...")
 
-    if not debug_port_open() and config.AUTO_LAUNCH_CHROME:
+    if not debug_port_open(port_i) and config.AUTO_LAUNCH_CHROME:
         print("[BROWSER] Chrome debug port not open — launching Chrome now...")
         try:
-            launch_debug_chrome(domain)
+            launch_debug_chrome(
+                domain,
+                port=port_i,
+                profile_dir=profile_dir,
+                proxy=proxy,
+                quit_existing=quit_existing,
+            )
         except Exception as e:
             print(f"[BROWSER] Could not launch Chrome: {e}")
             print(f"[BROWSER] Or run {chrome_start_script()} manually.")
             raise SystemExit(1) from e
         print("[BROWSER] Waiting for Chrome to start...")
-        if not await wait_for_debug_port(45):
+        if not await wait_for_debug_port(45, port=port_i):
             print("[BROWSER] Chrome did not open debug port in time.")
             raise SystemExit(1)
 
     last_error: Exception | None = None
     for attempt in range(1, 6):
         try:
-            # no_defaults avoids Browser.setDownloadBehavior which newer Mac
-            # Chrome rejects ("Browser context management is not supported").
             try:
-                browser = await p.chromium.connect_over_cdp(
-                    config.CHROME_DEBUG_URL, no_defaults=True
-                )
+                browser = await p.chromium.connect_over_cdp(cdp_url, no_defaults=True)
             except TypeError:
-                browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
+                browser = await p.chromium.connect_over_cdp(cdp_url)
             if not browser.contexts:
                 raise RuntimeError(
                     "Chrome has no open window/context. Keep Chrome open after start_chrome."
@@ -2308,7 +2940,11 @@ async def connect_existing_chrome(
 
 
 async def create_context(
-    p, mcfg: dict[str, Any], proxy: dict[str, str] | None = None
+    p,
+    mcfg: dict[str, Any],
+    proxy: dict[str, str] | None = None,
+    *,
+    worker_id: int = 0,
 ) -> tuple[BrowserContext, Page, Browser | None, bool]:
     profile = Path(config.USER_DATA_DIR)
     # Separate profile per marketplace so cookies/locale don't bleed across geos
@@ -2316,7 +2952,10 @@ async def create_context(
         (k for k, v in config.MARKETPLACES.items() if v.get("domain") == mcfg.get("domain")),
         "default",
     )
-    profile = profile / marketplace_key
+    if worker_id:
+        profile = profile / f"w{worker_id}" / marketplace_key
+    else:
+        profile = profile / marketplace_key
     profile.mkdir(parents=True, exist_ok=True)
 
     args = [
@@ -2365,7 +3004,7 @@ async def create_context(
     page = context.pages[0] if context.pages else await context.new_page()
     await apply_stealth(page)
     mode = "headless background" if config.HEADLESS else "visible"
-    print(f"[BROWSER] Started Chrome ({mode}) — no window interaction needed.")
+    print(f"[BROWSER] Started Chrome ({mode}) worker={worker_id} — no Enter needed.")
     return context, page, None, False
 
 
@@ -2413,40 +3052,58 @@ async def scrape_one_marketplace(
     page: Page,
     marketplace: str,
     run_folder: Path | None = None,
+    *,
+    asins_override: list[str] | None = None,
+    out_path_override: Path | None = None,
+    worker_id: int = 0,
+    results_seed: list[dict[str, Any]] | None = None,
+    done_seed: set[str] | None = None,
 ) -> Path:
     """Scrape one geo into its Excel. Returns output path."""
     mcfg = marketplace_cfg(marketplace)
     ensure_proxy_or_exit(marketplace, mcfg)
 
     try:
-        asins = load_asins(mcfg["asin_file"])
+        asins = list(asins_override) if asins_override is not None else load_asins(mcfg["asin_file"])
     except Exception as e:
         print(f"[FATAL] Could not load ASINs for {marketplace}: {e}")
         raise
 
-    if config.MAX_ASINS is not None:
+    if asins_override is None and config.MAX_ASINS is not None:
         asins = asins[: config.MAX_ASINS]
 
+    worker_tag = f" W{worker_id}" if worker_id else ""
     print(f"\n{'=' * 62}")
-    print(f"[INPUT] Marketplace: {marketplace.upper()} ({mcfg['name']})")
+    print(f"[INPUT] Marketplace: {marketplace.upper()} ({mcfg['name']}){worker_tag}")
     print(f"[INPUT] Domain: https://{mcfg['domain']}/")
-    print(f"[INPUT] {len(asins)} ASINs from {mcfg['asin_file']}")
+    print(f"[INPUT] {len(asins)} ASINs")
     print(
         f"[SAFE] delay {config.DELAY_BETWEEN_ASINS_MIN}-{config.DELAY_BETWEEN_ASINS_MAX}s | "
-        f"stop after {getattr(config, 'MAX_CONSECUTIVE_BLOCKS', 3)} blocks"
+        f"stop after {getattr(config, 'MAX_CONSECUTIVE_BLOCKS', 3)} blocks | "
+        f"Enter={'ON' if getattr(config, 'WARMUP_REQUIRE_ENTER', False) else 'OFF (auto)'}"
     )
 
-    if getattr(config, "NEW_FILE_EACH_RUN", True):
+    if out_path_override is not None:
+        out_path = Path(out_path_override)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        results = list(results_seed or [])
+        done = set(done_seed or set())
+        print(f"[OUTPUT] → {out_path}")
+    elif getattr(config, "NEW_FILE_EACH_RUN", True):
         out_path = make_run_output_path(marketplace, run_folder=run_folder)
-        results: list[dict[str, Any]] = []
-        done: set[str] = set()
+        results = list(results_seed or [])
+        done = set(done_seed or set())
         print(f"[OUTPUT] → {out_path}")
     else:
         out_path = Path(mcfg["output_file"])
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        results = load_results(out_path)
-        done = successful_asins(results) if config.RESUME_FROM_CHECKPOINT else set()
-        if getattr(config, "FORCE_RESCRAPE_ALL", False):
+        results = list(results_seed) if results_seed is not None else load_results(out_path)
+        done = (
+            set(done_seed)
+            if done_seed is not None
+            else (successful_asins(results) if config.RESUME_FROM_CHECKPOINT else set())
+        )
+        if getattr(config, "FORCE_RESCRAPE_ALL", False) and results_seed is None:
             done = set()
             results = []
         elif done:
@@ -2456,7 +3113,7 @@ async def scrape_one_marketplace(
     max_blocks = int(getattr(config, "MAX_CONSECUTIVE_BLOCKS", 3) or 3)
 
     if not await manual_warmup(page, mcfg["domain"], marketplace):
-        print(f"[STOP] Warmup failed for {marketplace.upper()} — skipping this geo.")
+        print(f"[STOP] Warmup failed for {marketplace.upper()}{worker_tag} — skipping.")
         save_results(results, out_path)
         return out_path
 
@@ -2467,7 +3124,7 @@ async def scrape_one_marketplace(
             print(f"[SKIP] Already done: {asin}")
             continue
 
-        print(f"\n----- [{marketplace.upper()}] ASIN {i}/{len(asins)}: {asin} -----")
+        print(f"\n----- [{marketplace.upper()}{worker_tag}] ASIN {i}/{len(asins)}: {asin} -----")
         rows: list[dict[str, Any]] = [
             empty_row(asin, marketplace, product_url(mcfg["domain"], asin))
         ]
@@ -2502,8 +3159,8 @@ async def scrape_one_marketplace(
             print(f"[SAFE] Consecutive blocks: {consecutive_blocks}/{max_blocks}")
             if consecutive_blocks >= max_blocks:
                 print(
-                    f"\n[STOP] Too many blocks on {marketplace.upper()}. "
-                    "Moving on / stopping this geo to protect IP."
+                    f"\n[STOP] Too many blocks on {marketplace.upper()}{worker_tag}. "
+                    "Stopping this worker to protect IP."
                 )
                 break
 
@@ -2517,9 +3174,211 @@ async def scrape_one_marketplace(
                 )
             )
 
-    print(f"\n[DONE] {marketplace.upper()} saved -> {out_path.resolve()}")
-    print(f"[DONE] {marketplace.upper()} rows: {len(results)}")
+    print(f"\n[DONE] {marketplace.upper()}{worker_tag} saved -> {out_path.resolve()}")
+    print(f"[DONE] {marketplace.upper()}{worker_tag} rows: {len(results)}")
     return out_path
+
+
+def _merge_worker_excels(part_paths: list[Path], final_path: Path) -> Path:
+    """Merge parallel worker Excel parts into one file."""
+    by_asin: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for part in part_paths:
+        rows = load_results(part)
+        file_groups: dict[str, list[dict[str, Any]]] = {}
+        file_order: list[str] = []
+        for r in rows:
+            asin = str(r.get("asin") or "").strip().upper()
+            if not asin:
+                continue
+            if asin not in file_groups:
+                file_groups[asin] = []
+                file_order.append(asin)
+            file_groups[asin].append(r)
+        for asin in file_order:
+            if asin not in by_asin:
+                order.append(asin)
+            by_asin[asin] = file_groups[asin]
+
+    merged: list[dict[str, Any]] = []
+    for asin in order:
+        merged.extend(by_asin.get(asin) or [])
+    save_results(merged, final_path)
+    return final_path
+
+
+def _parallel_worker_process(
+    worker_id: int,
+    marketplace: str,
+    asins: list[str],
+    run_folder_str: str | None,
+    out_part_str: str,
+) -> str:
+    """Process entry: one Chrome + optional proxy, no Enter (auto warmup)."""
+    os.chdir(_AMAZON_DIR)
+    if str(_AMAZON_DIR) not in sys.path:
+        sys.path.insert(0, str(_AMAZON_DIR))
+
+    async def _run() -> str:
+        mcfg = marketplace_cfg(marketplace)
+        proxy = resolve_worker_proxy(marketplace, worker_id)
+        port_base = int(getattr(config, "CHROME_DEBUG_PORT_BASE", 9223) or 9223)
+        port = port_base + worker_id
+        profile = Path(config.USER_DATA_DIR) / f"w{worker_id}" / marketplace
+        out_part = Path(out_part_str)
+        run_folder = Path(run_folder_str) if run_folder_str else None
+
+        print(f"\n[PARALLEL] Worker {worker_id} starting | ASINs={len(asins)} | port={port}")
+        if proxy:
+            print(f"[PARALLEL] Worker {worker_id} proxy → {proxy.get('server')}")
+        else:
+            print(f"[PARALLEL] Worker {worker_id} NO proxy (same IP risk)")
+
+        async with async_playwright() as p:
+            cdp_browser = None
+            context = None
+            using_cdp = False
+            if config.CONNECT_EXISTING_CHROME:
+                cdp_browser, context, page, using_cdp = await connect_existing_chrome(
+                    p,
+                    mcfg["domain"],
+                    port=port,
+                    profile_dir=profile,
+                    proxy=proxy,
+                    quit_existing=(worker_id == 0),
+                )
+            else:
+                context, page, _, using_cdp = await create_context(
+                    p, mcfg, proxy=proxy, worker_id=worker_id
+                )
+            try:
+                await scrape_one_marketplace(
+                    page,
+                    marketplace,
+                    run_folder,
+                    asins_override=asins,
+                    out_path_override=out_part,
+                    worker_id=worker_id,
+                )
+            finally:
+                if using_cdp and cdp_browser:
+                    await cdp_browser.close()
+                elif context is not None and not using_cdp:
+                    await context.close()
+        return str(out_part.resolve())
+
+    return asyncio.run(_run())
+
+
+async def scrape_one_marketplace_parallel(
+    marketplace: str,
+    run_folder: Path | None = None,
+) -> Path:
+    """Split ASINs across workers (~ASINs_PER_WORKER each), merge Excel at the end."""
+    mcfg = marketplace_cfg(marketplace)
+    ensure_proxy_or_exit(marketplace, mcfg)
+
+    asins = load_asins(mcfg["asin_file"])
+    if config.MAX_ASINS is not None:
+        asins = asins[: config.MAX_ASINS]
+
+    if getattr(config, "NEW_FILE_EACH_RUN", True):
+        final_path = make_run_output_path(marketplace, run_folder=run_folder)
+        results: list[dict[str, Any]] = []
+        done: set[str] = set()
+    else:
+        final_path = Path(mcfg["output_file"])
+        results = load_results(final_path)
+        done = successful_asins(results) if config.RESUME_FROM_CHECKPOINT else set()
+        if getattr(config, "FORCE_RESCRAPE_ALL", False):
+            done = set()
+            results = []
+
+    pending = [a for a in asins if a not in done]
+    n = worker_count(len(pending))
+    per = getattr(config, "ASINs_PER_WORKER", None) or 10
+    try:
+        per_i = max(1, int(per))
+    except (TypeError, ValueError):
+        per_i = 10
+
+    print(
+        f"\n[PARALLEL] {marketplace.upper()} | pending ASINs={len(pending)} | "
+        f"~{per_i}/browser → workers={n} (max {getattr(config, 'MAX_WORKERS', 15)})"
+    )
+    print("[PARALLEL] No Enter needed — auto warmup (WARMUP_REQUIRE_ENTER=False)")
+    if not pending:
+        print(f"[PARALLEL] Nothing to scrape for {marketplace.upper()}.")
+        save_results(results, final_path)
+        return final_path
+
+    if n <= 1 or len(pending) == 1:
+        chunks = [pending]
+    elif getattr(config, "ASINs_PER_WORKER", None) and getattr(config, "WORKERS", None) in (
+        None,
+        "",
+    ):
+        # Fixed 10 ASINs per browser, then cap to n workers by merging overflow
+        chunks = split_asins_fixed_size(pending, per_i)
+        if len(chunks) > n:
+            # Merge overflow into last allowed workers (round-robin extras)
+            extra = chunks[n:]
+            chunks = chunks[:n]
+            for i, ex in enumerate(extra):
+                chunks[i % n].extend(ex)
+    else:
+        chunks = split_asins_round_robin(pending, n)
+
+    jobs = [(i, chunk) for i, chunk in enumerate(chunks) if chunk]
+    print(
+        "[PARALLEL] Browser ASIN loads: "
+        + ", ".join(f"W{i}={len(c)}" for i, c in jobs)
+    )
+    part_paths = [
+        final_path.with_name(f"{final_path.stem}_w{wid}{final_path.suffix}")
+        for wid, _ in jobs
+    ]
+
+    for pp in part_paths:
+        save_results([], pp)
+
+    run_folder_str = str(run_folder.resolve()) if run_folder else None
+
+    results_parts: list[Path] = []
+    with ProcessPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {}
+        for (wid, chunk), pp in zip(jobs, part_paths):
+            fut = pool.submit(
+                _parallel_worker_process,
+                wid,
+                marketplace,
+                chunk,
+                run_folder_str,
+                str(pp),
+            )
+            futures[fut] = (wid, pp)
+            time.sleep(2.0)
+
+        for fut in as_completed(futures):
+            wid, pp = futures[fut]
+            try:
+                path_str = fut.result()
+                results_parts.append(Path(path_str))
+                print(f"[PARALLEL] Worker {wid} finished → {path_str}")
+            except Exception as e:
+                print(f"[PARALLEL] Worker {wid} FAILED: {e}")
+                if pp.exists():
+                    results_parts.append(pp)
+
+    merge_inputs: list[Path] = []
+    if results:
+        seed = final_path.with_name(f"{final_path.stem}_seed{final_path.suffix}")
+        save_results(results, seed)
+        merge_inputs.append(seed)
+    merge_inputs.extend(results_parts)
+    _merge_worker_excels(merge_inputs, final_path)
+    print(f"[PARALLEL] Merged → {final_path.resolve()}")
+    return final_path
 
 
 async def main() -> None:
@@ -2529,7 +3388,6 @@ async def main() -> None:
         print(f"[FATAL] {e}")
         sys.exit(1)
 
-    # Shared date-time folder when running one or all geos in this process
     run_folder = (
         make_shared_run_folder()
         if getattr(config, "NEW_FILE_EACH_RUN", True)
@@ -2540,49 +3398,83 @@ async def main() -> None:
     if len(marketplaces) > 1:
         print(f"[ALL] Will scrape in order: {', '.join(m.upper() for m in marketplaces)}")
 
+    use_auto = bool(getattr(config, "ASINs_PER_WORKER", None)) and getattr(
+        config, "WORKERS", None
+    ) in (None, "")
+    workers_hint = worker_count(150) if use_auto else worker_count()
+    print(
+        f"[CONFIG] ASINs_PER_WORKER={getattr(config, 'ASINs_PER_WORKER', None)} | "
+        f"MAX_WORKERS={getattr(config, 'MAX_WORKERS', 15)} | "
+        f"mode={'auto(~10/browser)' if use_auto else f'fixed({workers_hint})'} | "
+        f"WARMUP_REQUIRE_ENTER={getattr(config, 'WARMUP_REQUIRE_ENTER', False)}"
+    )
+
     first = marketplaces[0]
     first_cfg = marketplace_cfg(first)
-    # Validate proxy rules up front for all targets
     for m in marketplaces:
         ensure_proxy_or_exit(m, marketplace_cfg(m))
 
     saved: list[Path] = []
 
-    async with async_playwright() as p:
-        cdp_browser: Browser | None = None
-        using_cdp = False
-        proxy = resolve_proxy(first)
-
-        if config.CONNECT_EXISTING_CHROME:
-            cdp_browser, context, page, using_cdp = await connect_existing_chrome(
-                p, first_cfg["domain"]
+    # Auto parallel whenever ASINs_PER_WORKER is set (or fixed WORKERS > 1)
+    use_parallel = use_auto or worker_count() > 1
+    if use_parallel:
+        print(
+            "[PARALLEL] Auto browser count from ASINs (10 each). "
+            "No Enter — captcha auto-wait if shown."
+        )
+        for idx, marketplace in enumerate(marketplaces, start=1):
+            print(
+                f"\n\n######## GEO {idx}/{len(marketplaces)}: "
+                f"{marketplace.upper()} (parallel) ########"
             )
-        else:
-            context, page, _, using_cdp = await create_context(
-                p, first_cfg, proxy=proxy
-            )
+            try:
+                out = await scrape_one_marketplace_parallel(marketplace, run_folder)
+                saved.append(out)
+            except Exception as e:
+                print(f"[ERROR] {marketplace.upper()} parallel failed: {e}")
+                continue
+            if idx < len(marketplaces):
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+    else:
+        async with async_playwright() as p:
+            cdp_browser: Browser | None = None
+            using_cdp = False
+            proxy = resolve_proxy(first)
 
-        try:
-            for idx, marketplace in enumerate(marketplaces, start=1):
-                print(f"\n\n######## GEO {idx}/{len(marketplaces)}: {marketplace.upper()} ########")
-                if idx > 1:
+            if config.CONNECT_EXISTING_CHROME:
+                cdp_browser, context, page, using_cdp = await connect_existing_chrome(
+                    p, first_cfg["domain"], proxy=proxy, quit_existing=True
+                )
+            else:
+                context, page, _, using_cdp = await create_context(
+                    p, first_cfg, proxy=proxy
+                )
+
+            try:
+                for idx, marketplace in enumerate(marketplaces, start=1):
                     print(
-                        f"[ALL] Switching to {marketplace.upper()}. "
-                        "Pass captcha on that Amazon site if shown, then continue."
+                        f"\n\n######## GEO {idx}/{len(marketplaces)}: "
+                        f"{marketplace.upper()} ########"
                     )
-                try:
-                    out = await scrape_one_marketplace(page, marketplace, run_folder)
-                    saved.append(out)
-                except Exception as e:
-                    print(f"[ERROR] {marketplace.upper()} failed: {e}")
-                    continue
-                if idx < len(marketplaces):
-                    await asyncio.sleep(random.uniform(2.0, 4.0))
-        finally:
-            if using_cdp and cdp_browser:
-                await cdp_browser.close()
-            elif not using_cdp:
-                await context.close()
+                    if idx > 1:
+                        print(
+                            f"[ALL] Switching to {marketplace.upper()}. "
+                            "Captcha auto-wait if shown (no Enter)."
+                        )
+                    try:
+                        out = await scrape_one_marketplace(page, marketplace, run_folder)
+                        saved.append(out)
+                    except Exception as e:
+                        print(f"[ERROR] {marketplace.upper()} failed: {e}")
+                        continue
+                    if idx < len(marketplaces):
+                        await asyncio.sleep(random.uniform(2.0, 4.0))
+            finally:
+                if using_cdp and cdp_browser:
+                    await cdp_browser.close()
+                elif not using_cdp:
+                    await context.close()
 
     print("\n" + "=" * 62)
     print("[DONE] All requested marketplaces finished.")
@@ -2592,4 +3484,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        from multiprocessing import freeze_support
+
+        freeze_support()
+    except Exception:
+        pass
     asyncio.run(main())

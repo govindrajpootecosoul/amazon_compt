@@ -1,19 +1,21 @@
-# Amazon scraper — slow mode (no proxy, from India)
+# Amazon scraper — slow mode (no proxy)
 
 ## How to run
 
-1. Close all Chrome windows
-2. Double-click `amazon/start_chrome.bat`
+1. Quit all Chrome windows
+2. Start debug Chrome:
+   - **Windows:** double-click `amazon/start_chrome.bat`
+   - **Mac:** `chmod +x amazon/start_chrome.sh && ./amazon/start_chrome.sh`
 3. Pass captcha if shown
 4. Terminal:
 
 ```bash
-cd c:\govind\walmartscrapper\amazon
+cd amazon
 
 # One marketplace
 python scraper.py us
 
-# ALL marketplaces in ONE command (US → UK → DE → CA)
+# ALL marketplaces (US → UK → DE → CA → AE)
 python scraper.py all
 ```
 
@@ -24,8 +26,7 @@ python scraper.py all
 output/2026-09-11_100800/
   amazon_us_data.xlsx
   amazon_uk_data.xlsx
-  amazon_de_data.xlsx
-  amazon_ca_data.xlsx
+  ...
 ```
 
 ## Config highlights (`amazon/config.py`)

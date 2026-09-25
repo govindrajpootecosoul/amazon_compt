@@ -1,13 +1,44 @@
-# How to run
+# How to run (Windows + Mac)
 
-1. Install Google Chrome (required — Walmart blocks headless Chromium).
+## Setup (both OS)
+
+1. Install Google Chrome
 2. `pip install -r requirements.txt`
 3. `python -m playwright install chromium`
-4. Paste Item IDs into `inputs/item_ids.txt`
-5. Paste ZIP codes into `inputs/zip_codes.txt`
-6. Optional: set `PROXY_SERVER` in `config.py` (US residential)
-7. Optional test: set `MAX_ZIPS = 1` and `MAX_ITEMS = 1` in `config.py`
-8. Run: `python scraper.py`
-9. Results: `output/walmart_scraped_data.xlsx`
 
-Failed rows (empty title/price) are retried on the next run. Successful rows are skipped.
+## Walmart
+
+**Windows:** double-click `start_chrome.bat`  
+**Mac:**
+
+```bash
+chmod +x start_chrome.sh
+./start_chrome.sh
+```
+
+Then pass captcha → `python scraper.py`
+
+## Amazon
+
+**Windows:** double-click `amazon/start_chrome.bat`  
+**Mac:**
+
+```bash
+cd amazon
+chmod +x start_chrome.sh
+./start_chrome.sh
+```
+
+Then:
+
+```bash
+python scraper.py us
+# or: uk / de / ca / ae / all
+```
+
+## Notes
+
+- Scraper auto-finds Chrome on Windows and Mac if you just run `python scraper.py`
+- Ports: Walmart `9222`, Amazon `9223`
+- Quit all Chrome windows before starting the debug Chrome script
+- Browser profile cookies stay local (not in git)

@@ -26,7 +26,9 @@ Playwright Chrome is **detected** → "Press & Hold" shows **Please try again**.
 
 **Do this instead:**
 
-1. Double-click **`start_chrome.bat`**
+1. Start Chrome with debug port:
+   - **Windows:** double-click **`start_chrome.bat`**
+   - **Mac:** `chmod +x start_chrome.sh && ./start_chrome.sh`
 2. In that Chrome, open https://www.walmart.com/ and pass the captcha
 3. Run **`python scraper.py`** and press ENTER when homepage loads
 

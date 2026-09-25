@@ -260,8 +260,12 @@ async def manual_warmup(page: Page) -> bool:
 
     print("\n" + "=" * 62)
     if config.CONNECT_EXISTING_CHROME:
-        print("WARMUP: Use Chrome opened by start_chrome.bat (NOT Playwright Chrome).")
-        print("  1) Double-click start_chrome.bat")
+        hint = chrome_start_script()
+        print(f"WARMUP: Use Chrome opened by {hint} (NOT Playwright Chrome).")
+        if sys.platform == "win32":
+            print(f"  1) Double-click {hint}")
+        else:
+            print(f"  1) In Terminal: chmod +x {hint} && ./{hint}")
         print("  2) In that Chrome, open https://www.walmart.com/")
         print("  3) Complete 'Press & Hold' until homepage loads")
         print("  4) Come back here and press ENTER")
@@ -280,7 +284,7 @@ async def manual_warmup(page: Page) -> bool:
     title = await page.title()
     if is_challenge_html(html, title):
         print("[WARMUP] Still on 'Robot or human?'. Captcha did NOT pass.")
-        print("[WARMUP] Close Playwright Chrome. Use start_chrome.bat instead, then run again.")
+        print(f"[WARMUP] Close Playwright Chrome. Use {chrome_start_script()} instead, then run again.")
         return False
 
     print("[WARMUP] OK — Walmart session looks good. Starting scrape...\n")
@@ -1394,14 +1398,34 @@ async def scrape_walmart_item(
 # ---------------------------------------------------------------------------
 
 
+def chrome_start_script() -> str:
+    """Platform-specific helper script name (repo root)."""
+    return "start_chrome.bat" if sys.platform == "win32" else "start_chrome.sh"
+
+
 def find_chrome_executable() -> Path | None:
-    candidates = [
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-    ]
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+    else:
+        candidates = [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/chromium-browser"),
+            Path("/usr/bin/chromium"),
+            Path("/snap/bin/chromium"),
+        ]
     for path in candidates:
         if path.exists():
             return path
@@ -1418,6 +1442,47 @@ def debug_port_open() -> bool:
         return False
 
 
+def _clear_chrome_profile_locks(profile: Path) -> None:
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _quit_chrome_processes() -> None:
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        time.sleep(1)
+        for name in ("Google Chrome", "Google Chrome Helper"):
+            subprocess.run(
+                ["killall", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    elif sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        subprocess.run(
+            ["killall", "chrome", "google-chrome", "chromium"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    time.sleep(1.5)
+
+
 def launch_debug_chrome() -> None:
     chrome = find_chrome_executable()
     if not chrome:
@@ -1427,14 +1492,41 @@ def launch_debug_chrome() -> None:
 
     profile = Path(config.USER_DATA_DIR).resolve()
     profile.mkdir(parents=True, exist_ok=True)
+    _quit_chrome_processes()
+    _clear_chrome_profile_locks(profile)
+
+    url = "https://www.walmart.com/"
+    port = str(config.CHROME_DEBUG_PORT)
+    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {port})")
+
+    if sys.platform == "darwin":
+        subprocess.Popen(
+            [
+                "open",
+                "-na",
+                "Google Chrome",
+                "--args",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return
 
     cmd = [
         str(chrome),
-        f"--remote-debugging-port={config.CHROME_DEBUG_PORT}",
-        f'--user-data-dir={profile}',
-        "https://www.walmart.com/",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
     ]
-    print(f"[BROWSER] Starting Chrome: {chrome.name} (port {config.CHROME_DEBUG_PORT})")
     subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -1462,19 +1554,28 @@ async def connect_existing_chrome(p) -> tuple[Browser, BrowserContext, Page, boo
             launch_debug_chrome()
         except Exception as e:
             print(f"[BROWSER] Could not launch Chrome: {e}")
-            print("[BROWSER] Or double-click start_chrome.bat manually.")
+            print(f"[BROWSER] Or run {chrome_start_script()} manually.")
             raise SystemExit(1) from e
         print("[BROWSER] Waiting for Chrome to start...")
         if not await wait_for_debug_port(45):
             print("[BROWSER] Chrome did not open debug port in time.")
-            print("[BROWSER] Close ALL Chrome windows, then run start_chrome.bat or scraper.py again.")
+            print(f"[BROWSER] Close ALL Chrome windows, then run {chrome_start_script()} or scraper.py again.")
             raise SystemExit(1)
 
     last_error: Exception | None = None
     for attempt in range(1, 6):
         try:
-            browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            try:
+                browser = await p.chromium.connect_over_cdp(
+                    config.CHROME_DEBUG_URL, no_defaults=True
+                )
+            except TypeError:
+                browser = await p.chromium.connect_over_cdp(config.CHROME_DEBUG_URL)
+            if not browser.contexts:
+                raise RuntimeError(
+                    "Chrome has no open window/context. Keep Chrome open after start_chrome."
+                )
+            context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
             print("[BROWSER] Connected to Chrome.")
             return browser, context, page, True
@@ -1485,9 +1586,11 @@ async def connect_existing_chrome(p) -> tuple[Browser, BrowserContext, Page, boo
 
     print(f"[BROWSER] Could not connect: {last_error}")
     print("[BROWSER] Fix:")
-    print("  1) Close all Chrome windows")
-    print("  2) Double-click start_chrome.bat  OR  run python scraper.py again")
+    print("  1) Quit ALL Chrome (Cmd+Q on Mac)")
+    print(f"  2) Run {chrome_start_script()}  OR  run python3 scraper.py again")
     print("  3) Pass Walmart captcha in that Chrome window")
+    if last_error and "setDownloadBehavior" in str(last_error):
+        print("[BROWSER] Also upgrade Playwright:  pip3 install -U 'playwright>=1.60'")
     raise SystemExit(1) from last_error
 
 

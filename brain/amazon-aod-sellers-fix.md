@@ -1,13 +1,21 @@
-# Shipper / Seller junk in buybox_seller
+# AOD "Sold by" owner (not "More")
 
-## Cause
+## Rule
 
-Amazon.ae AOD UI column header text `Shipper / Seller` was scraped as the seller name.
+**Owner = text right after `Sold by`** (same row / soldBy block / regex).
 
-## Fix
+Never use position-based "More" / "Details" / expand links.
 
-- Reject labels: `Shipper / Seller`, `Sold by`, etc.
-- Read the **next cell / sibling / seller link** for the real merchant name
-- Skip header-only rows without a price
+## Examples
 
-Re-run: `python scraper.py ae`
+- `Sold by Kolhapurwala's` → `Kolhapurwala's`
+- `Sold by PEAK NEST FZ LLE` → `PEAK NEST FZ LLE`
+- `TGMarket AE TGMarket AE Sold by TGMarket AE` → `TGMarket AE` (deduped)
+
+## Parallel + blank winners
+
+When main buy box has price but blank owner, fill from:
+
+1. Same-price AOD offer (`_norm_price_key`)
+2. Pinned / first AOD card
+3. Ships-from / fulfilled Amazon label only (not blind Amazon.ae)
