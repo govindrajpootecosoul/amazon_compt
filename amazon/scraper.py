@@ -3207,6 +3207,40 @@ def _merge_worker_excels(part_paths: list[Path], final_path: Path) -> Path:
     return final_path
 
 
+def _delete_worker_part_files(part_paths: list[Path], final_path: Path) -> int:
+    """After successful merge, delete separate worker/seed Excel parts (keep final only)."""
+    deleted = 0
+    final_resolved = final_path.resolve()
+    seen: set[Path] = set()
+    for part in part_paths:
+        try:
+            p = part.resolve()
+        except Exception:
+            p = part
+        if p in seen:
+            continue
+        seen.add(p)
+        if p == final_resolved:
+            continue
+        if not part.exists():
+            continue
+        # Only delete known worker/seed siblings: *_wN.xlsx / *_seed.xlsx
+        name = part.name.lower()
+        stem = final_path.stem.lower()
+        if not (
+            name.startswith(stem)
+            and (re.search(r"_w\d+\.xlsx$", name) or name.endswith("_seed.xlsx"))
+        ):
+            continue
+        try:
+            part.unlink()
+            deleted += 1
+            print(f"[PARALLEL] Deleted part -> {part.name}")
+        except Exception as e:
+            print(f"[PARALLEL] Could not delete {part.name}: {e}")
+    return deleted
+
+
 def _parallel_worker_process(
     worker_id: int,
     marketplace: str,
@@ -3345,39 +3379,60 @@ async def scrape_one_marketplace_parallel(
     run_folder_str = str(run_folder.resolve()) if run_folder else None
 
     results_parts: list[Path] = []
-    with ProcessPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {}
-        for (wid, chunk), pp in zip(jobs, part_paths):
-            fut = pool.submit(
-                _parallel_worker_process,
-                wid,
-                marketplace,
-                chunk,
-                run_folder_str,
-                str(pp),
-            )
-            futures[fut] = (wid, pp)
-            time.sleep(2.0)
+    try:
+        with ProcessPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {}
+            for (wid, chunk), pp in zip(jobs, part_paths):
+                fut = pool.submit(
+                    _parallel_worker_process,
+                    wid,
+                    marketplace,
+                    chunk,
+                    run_folder_str,
+                    str(pp),
+                )
+                futures[fut] = (wid, pp)
+                time.sleep(2.0)
 
-        for fut in as_completed(futures):
-            wid, pp = futures[fut]
+            for fut in as_completed(futures):
+                wid, pp = futures[fut]
+                try:
+                    path_str = fut.result()
+                    results_parts.append(Path(path_str))
+                    print(f"[PARALLEL] Worker {wid} finished → {path_str}")
+                except Exception as e:
+                    print(f"[PARALLEL] Worker {wid} FAILED: {e}")
+                    if pp.exists():
+                        results_parts.append(pp)
+    except KeyboardInterrupt:
+        print("[PARALLEL] Interrupted — merging whatever worker parts exist…")
+        raise
+    finally:
+        # Always merge parts that exist (even if run killed mid-way / worker crash)
+        existing = [pp for pp in part_paths if pp.exists()]
+        for pp in existing:
+            if pp not in results_parts:
+                results_parts.append(pp)
+        merge_inputs: list[Path] = []
+        if results:
+            seed = final_path.with_name(f"{final_path.stem}_seed{final_path.suffix}")
             try:
-                path_str = fut.result()
-                results_parts.append(Path(path_str))
-                print(f"[PARALLEL] Worker {wid} finished → {path_str}")
+                save_results(results, seed)
+                merge_inputs.append(seed)
             except Exception as e:
-                print(f"[PARALLEL] Worker {wid} FAILED: {e}")
-                if pp.exists():
-                    results_parts.append(pp)
-
-    merge_inputs: list[Path] = []
-    if results:
-        seed = final_path.with_name(f"{final_path.stem}_seed{final_path.suffix}")
-        save_results(results, seed)
-        merge_inputs.append(seed)
-    merge_inputs.extend(results_parts)
-    _merge_worker_excels(merge_inputs, final_path)
-    print(f"[PARALLEL] Merged → {final_path.resolve()}")
+                print(f"[PARALLEL] seed save failed: {e}")
+        merge_inputs.extend(results_parts)
+        if merge_inputs:
+            try:
+                _merge_worker_excels(merge_inputs, final_path)
+                print(f"[PARALLEL] Merged → {final_path.resolve()}")
+                n_del = _delete_worker_part_files(merge_inputs, final_path)
+                if n_del:
+                    print(f"[PARALLEL] Cleaned {n_del} separate worker file(s)")
+            except Exception as e:
+                print(f"[PARALLEL] Merge FAILED: {e} (worker parts kept)")
+        else:
+            print("[PARALLEL] No worker parts to merge.")
     return final_path
 
 
